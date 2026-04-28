@@ -20,7 +20,7 @@ See [`DESIGN.md`](./DESIGN.md) for the full plan: hypothesis, staged approach, h
 - **Stage A** — manual forward pass for Qwen3 (GQA + RoPE + RMSNorm + SwiGLU + Qwen3 QK-norm); contiguous KV cache; greedy speculative decoding with Qwen3-0.6B as the draft. PyTorch + Triton; no `transformers.AutoModelForCausalLM` in the hot path.
 - **Stage A.5** — profile on a CUDA GPU; one Triton kernel for whichever op profiling identifies as the decode bottleneck.
 - **Stage B** — calibrate on ~1k instruction samples; activation-aware SVD on K/V projections; partial-RoPE split following DeepSeek-V3; eval on perplexity and downstream tasks.
-- **Stage C** — sweep KV compression × draft-K (× INT4 quantization, optional) at fixed 16 GB VRAM. Pareto frontier of throughput vs perplexity.
+- **Stage C** — sweep target-compression × draft-compression × draft-K at fixed 16 GB VRAM. Three named regimes — both uncompressed, target only, both compressed at matched ratios — directly test whether coupling the SVD distortion across target and draft preserves spec-decode acceptance rate relative to compressing the target alone. Pareto frontier of throughput vs perplexity.
 
 Target hardware: RTX 5060 Ti 16 GB (Blackwell). Development on MacBook M2 (CPU/MPS for engine work; CUDA desktop for Triton, profiling, and the sweeps).
 

@@ -26,12 +26,13 @@ This project asks: **how cleanly can a public MHA/GQA model be converted to MLA 
 
 A post-hoc MHA→MLA conversion of Qwen3-4B via activation-aware SVD with partial-RoPE achieves at least **4× KV-cache compression** with **≤2% perplexity degradation** on standard benchmarks (HellaSwag, WikiText-103, MMLU subset), without healing finetune.
 
-KV compression and speculative decoding interact in two opposing ways:
+The headline question is how MLA compression interacts with speculative decoding under three distinct regimes:
 
-- **Pro:** smaller KV footprint shifts more of the decode-step memory budget to weights, improving HBM cache locality and potentially raising tok/s for both target and draft.
-- **Con:** lossy K/V reconstruction can subtly shift the target's logit distribution, lowering draft-target agreement and hence the spec-decode acceptance rate.
+1. **Both uncompressed** — baseline MHA spec decode.
+2. **Target only compressed** — the naive application. The draft was calibrated against the *original* target's distribution; any post-conversion shift in target's logits potentially lowers draft-target agreement, partially offsetting the per-round verification speedup from cheaper KV reads.
+3. **Both target and draft compressed (coupled distortion)** — the non-obvious hypothesis. If the same activation-aware SVD pipeline is applied to both models on the same calibration data, the resulting distortions in target and draft are correlated: both models drift in similar directions, potentially preserving (or even improving) draft-target alignment relative to (2).
 
-The phase diagram across compression ratio × draft-K × VRAM ceiling is the contribution.
+A priori, the sign of the interaction is unclear in any of these regimes. At 4× compression with ≤2% perplexity loss, ~98% of token-level argmaxes are unchanged — acceptance might barely move. The Pareto frontier across (target-compression × draft-compression × draft-K × VRAM ceiling) is the contribution; a finding that coupled distortion preserves acceptance materially better than target-only is the cleanest headline outcome, but a "no significant interaction" result is also informative and publishable.
 
 ---
 
@@ -88,20 +89,29 @@ Build a `MLAttention` module that drops into the existing decoder block in place
 Run the joint sweep at fixed 16 GB VRAM ceiling.
 
 Axes:
-- KV compression ratio: {1× (baseline MHA), 2×, 4×, 6×, 8×}.
-- Speculative-decode K: {3, 5, 7}.
-- (Optional) INT4 quantization of weights via `bitsandbytes` or hand-rolled.
+- **Target compression ratio:** {1× (baseline MHA), 2×, 4×, 6×, 8×}.
+- **Draft compression ratio:** {1× (uncompressed), matched-to-target, independently-swept}.
+- **Speculative-decode K:** {3, 5, 7}.
+- *(Optional)* INT4 quantization of weights via `bitsandbytes` or hand-rolled.
 
-Metrics per cell: tok/s, acceptance rate, perplexity, max usable sequence length, peak VRAM.
+Three named regimes anchor the (target × draft) plane and are reported individually:
+
+- **R1 — both uncompressed:** baseline MHA spec decode. Establishes the reference acceptance rate and tok/s.
+- **R2 — target only compressed:** measures the verification-speedup vs acceptance-rate-shift trade-off when only the target is converted (the naive application).
+- **R3 — both compressed at matched ratios (coupled distortion):** measures whether applying the same SVD pipeline + calibration data to both models preserves draft-target alignment relative to R2.
+
+Metrics per cell: tok/s, acceptance rate, perplexity (target only — draft perplexity is irrelevant), max usable sequence length, peak VRAM.
 
 Output:
-- Pareto frontier chart (throughput vs perplexity, parameterised by compression).
+- Pareto frontier chart (throughput vs perplexity, parameterised by target compression and faceted by regime R1/R2/R3).
+- A "regime delta" plot: acceptance rate at R3 minus acceptance rate at R2 across compression ratios — directly tests the coupled-distortion hypothesis.
 - 5–10 page writeup. Target: workshop / blog post.
 - Reproducible code + cached calibration data + per-cell logs.
 
 **Stage C success criteria:**
-- Phase diagram showing the regime where MLA compression is *complementary* to speculative decoding versus where compression's KV-locality benefit is offset by acceptance-rate degradation.
-- One headline number for the resume / interview pitch (e.g. "4× KV compression on Qwen3-4B, 30% throughput improvement at fixed VRAM, ≤2% perplexity loss").
+- Phase diagram across (target compression × draft compression × K) showing where compression is complementary to spec decode vs where it costs more in acceptance than it gains in verification speed.
+- A clear answer on whether coupled distortion (R3) preserves acceptance materially better than target-only (R2). Either sign is publishable; null result is publishable too.
+- One headline number for the resume / interview pitch (e.g., "4× KV compression on both target and draft preserves 95% of baseline acceptance rate while extending usable context from X to Y at fixed 16 GB VRAM").
 
 ---
 
