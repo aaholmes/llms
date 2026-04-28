@@ -571,6 +571,10 @@ def main() -> None:
     p.add_argument("--dtype", type=str, default="bfloat16", choices=["bfloat16", "float16", "float32"])
     p.add_argument("--skip-greedy", action="store_true")
     p.add_argument("--skip-spec", action="store_true")
+    p.add_argument(
+        "--use-triton", action="store_true",
+        help="Enable Triton kernels (Stage A.5a: fused gate-up-silu).",
+    )
     args = p.parse_args()
 
     device = _autodevice() if args.device == "auto" else torch.device(args.device)
@@ -582,7 +586,14 @@ def main() -> None:
         # Scope the staged state-dict tensors locally so the duplicate GPU copy
         # is freed before the next model loads (same pattern as bench/demo.py).
         loaded = load_weights(model_id, dtype=dtype, device=device)
-        return Qwen3Model.from_loaded(loaded).to(dtype=dtype, device=device).eval()
+        model = (
+            Qwen3Model.from_loaded(loaded).to(dtype=dtype, device=device).eval()
+        )
+        if args.use_triton:
+            from kernels import apply_triton_kernels
+
+            apply_triton_kernels(model)
+        return model
 
     print(f"[profile] device={device} dtype={args.dtype}")
     print(f"[profile] loading target {args.target} ...")

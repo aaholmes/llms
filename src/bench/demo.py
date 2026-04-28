@@ -48,9 +48,16 @@ def _run_greedy(model: Qwen3Model, prompt_ids: torch.Tensor, n_new: int) -> list
     return out
 
 
-def _load(model_id: str, dtype: torch.dtype, device: str) -> Qwen3Model:
+def _load(
+    model_id: str, dtype: torch.dtype, device: str, *, use_triton: bool = False
+) -> Qwen3Model:
     loaded = load_weights(model_id, dtype=dtype, device=device)
-    return Qwen3Model.from_loaded(loaded).to(dtype=dtype, device=device).eval()
+    model = Qwen3Model.from_loaded(loaded).to(dtype=dtype, device=device).eval()
+    if use_triton:
+        from kernels import apply_triton_kernels
+
+        apply_triton_kernels(model)
+    return model
 
 
 def main() -> None:
@@ -62,6 +69,10 @@ def main() -> None:
     p.add_argument("--K", type=int, default=4)
     p.add_argument("--device", type=str, default="auto")
     p.add_argument("--dtype", type=str, default="bfloat16", choices=list(DTYPES))
+    p.add_argument(
+        "--use-triton", action="store_true",
+        help="Enable Triton kernels (Stage A.5a: fused gate-up-silu).",
+    )
     args = p.parse_args()
 
     device = _autodetect_device() if args.device == "auto" else args.device
@@ -69,16 +80,19 @@ def main() -> None:
 
     tok = AutoTokenizer.from_pretrained(args.target)
     prompt_ids = tok(args.prompt, return_tensors="pt").input_ids.to(device)
-    print(f"prompt: {args.prompt!r} ({prompt_ids.shape[1]} tokens) device={device} dtype={args.dtype}")
+    print(
+        f"prompt: {args.prompt!r} ({prompt_ids.shape[1]} tokens) "
+        f"device={device} dtype={args.dtype} triton={args.use_triton}"
+    )
 
     print(f"loading target: {args.target}")
-    target = _load(args.target, dtype, device)
+    target = _load(args.target, dtype, device, use_triton=args.use_triton)
     if args.draft == args.target:
         draft = target
         print("(self-spec — draft is the target)")
     else:
         print(f"loading draft:  {args.draft}")
-        draft = _load(args.draft, dtype, device)
+        draft = _load(args.draft, dtype, device, use_triton=args.use_triton)
 
     # Greedy baseline
     t0 = time.perf_counter()
