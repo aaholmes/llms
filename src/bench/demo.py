@@ -48,16 +48,9 @@ def _run_greedy(model: Qwen3Model, prompt_ids: torch.Tensor, n_new: int) -> list
     return out
 
 
-def _load(
-    model_id: str, dtype: torch.dtype, device: str, *, use_triton: bool = False
-) -> Qwen3Model:
+def _load(model_id: str, dtype: torch.dtype, device: str) -> Qwen3Model:
     loaded = load_weights(model_id, dtype=dtype, device=device)
-    model = Qwen3Model.from_loaded(loaded).to(dtype=dtype, device=device).eval()
-    if use_triton:
-        from kernels import apply_triton_kernels
-
-        apply_triton_kernels(model)
-    return model
+    return Qwen3Model.from_loaded(loaded).to(dtype=dtype, device=device).eval()
 
 
 def main() -> None:
@@ -86,22 +79,26 @@ def main() -> None:
     )
 
     print(f"loading target: {args.target}")
-    target = _load(args.target, dtype, device, use_triton=args.use_triton)
+    target = _load(args.target, dtype, device)
     if args.draft == args.target:
         draft = target
         print("(self-spec — draft is the target)")
     else:
         print(f"loading draft:  {args.draft}")
-        draft = _load(args.draft, dtype, device, use_triton=args.use_triton)
+        draft = _load(args.draft, dtype, device)
 
-    # Prewarm autotune AFTER all loads — Triton's do_bench allocates a 256 MB
-    # cache-flush buffer that won't fit alongside the transient state-dict
-    # duplicates that load_weights leaves on GPU until GC.
+    # Apply Triton kernels and prewarm autotune AFTER all loads — both
+    # operations allocate transient GPU memory (W_qkv concat in
+    # apply_triton_kernels; cache-flush buffer in autotune do_bench) that
+    # won't fit alongside the staged state-dict duplicates load_weights
+    # leaves on GPU until GC.
     if args.use_triton:
-        from kernels import prewarm_triton_kernels
+        from kernels import apply_triton_kernels, prewarm_triton_kernels
 
+        apply_triton_kernels(target)
         prewarm_triton_kernels(target)
         if draft is not target:
+            apply_triton_kernels(draft)
             prewarm_triton_kernels(draft)
 
     # Greedy baseline

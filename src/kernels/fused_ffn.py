@@ -17,35 +17,10 @@ from torch import nn
 import triton
 import triton.language as tl
 
-
-# Autotune configs. Sized for BF16 production (the deployment dtype) within
-# the 100 KB shared-memory budget on SM 12.0. The shared-mem cost per config
-# is approximately ``num_stages * (BLOCK_M*BLOCK_K + 2*BLOCK_K*BLOCK_N) *
-# bf16_bytes``; values below all stay under ~70 KB.
-#
-# All use BLOCK_M=16 because Triton's tl.dot needs M-tile >= 16; for decode
-# (M=1..8) the row mask drops the wasted rows.
-_AUTOTUNE_CONFIGS = [
-    triton.Config(  # ~70 KB
-        {"BLOCK_M": 16, "BLOCK_N": 128, "BLOCK_K": 64},
-        num_warps=4, num_stages=2,
-    ),
-    triton.Config(  # ~52 KB — more pipeline stages, smaller K
-        {"BLOCK_M": 16, "BLOCK_N": 128, "BLOCK_K": 32},
-        num_warps=4, num_stages=3,
-    ),
-    triton.Config(  # ~55 KB — more N parallelism per program
-        {"BLOCK_M": 16, "BLOCK_N": 64, "BLOCK_K": 64},
-        num_warps=4, num_stages=3,
-    ),
-    triton.Config(  # ~67 KB — wider N tile for cases where SM count limits
-        {"BLOCK_M": 16, "BLOCK_N": 256, "BLOCK_K": 32},
-        num_warps=8, num_stages=2,
-    ),
-]
+from ._autotune import MATMUL_AUTOTUNE_CONFIGS
 
 
-@triton.autotune(configs=_AUTOTUNE_CONFIGS, key=["M", "N", "K"])
+@triton.autotune(configs=MATMUL_AUTOTUNE_CONFIGS, key=["M", "N", "K"])
 @triton.jit
 def _fused_gate_up_silu_kernel(
     # Pointers to inputs / output

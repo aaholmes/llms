@@ -586,14 +586,9 @@ def main() -> None:
         # Scope the staged state-dict tensors locally so the duplicate GPU copy
         # is freed before the next model loads (same pattern as bench/demo.py).
         loaded = load_weights(model_id, dtype=dtype, device=device)
-        model = (
+        return (
             Qwen3Model.from_loaded(loaded).to(dtype=dtype, device=device).eval()
         )
-        if args.use_triton:
-            from kernels import apply_triton_kernels
-
-            apply_triton_kernels(model)
-        return model
 
     print(f"[profile] device={device} dtype={args.dtype}")
     print(f"[profile] loading target {args.target} ...")
@@ -609,12 +604,18 @@ def main() -> None:
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
 
-    # Prewarm autotune AFTER all loads complete and staged state-dicts have
-    # been GC'd — Triton's do_bench allocates a 256 MB cache-flush buffer
-    # that won't fit alongside the transient weight duplicates.
+    # Apply Triton kernels and prewarm autotune AFTER all loads — both
+    # operations allocate transient GPU memory (W_qkv concat in
+    # apply_triton_kernels; cache-flush buffer in autotune do_bench) that
+    # won't fit alongside the staged state-dict duplicates load_weights
+    # leaves on GPU until GC.
     if args.use_triton:
-        from kernels import prewarm_triton_kernels
+        from kernels import apply_triton_kernels, prewarm_triton_kernels
 
+        print("[profile] applying Triton kernels ...")
+        apply_triton_kernels(target)
+        if draft is not target:
+            apply_triton_kernels(draft)
         print("[profile] prewarming Triton autotune cache ...")
         prewarm_triton_kernels(target)
         if draft is not target:

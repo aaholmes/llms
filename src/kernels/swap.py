@@ -16,26 +16,33 @@ import torch
 from torch import nn
 
 from .fused_ffn import TritonFFN
+from .fused_qkv import TritonAttention
 
 
-def apply_triton_kernels(model: nn.Module, *, fused_ffn: bool = True) -> nn.Module:
-    """Replace ``DecoderBlock.ffn`` with ``TritonFFN`` on every layer.
+def apply_triton_kernels(
+    model: nn.Module,
+    *,
+    fused_ffn: bool = True,
+    fused_qkv: bool = True,
+) -> nn.Module:
+    """Replace ``DecoderBlock.ffn`` / ``DecoderBlock.attn`` with the
+    Triton-backed counterparts on every layer.
 
     Args:
         model: a ``Qwen3Model`` (must expose ``model.layers`` of decoder
-            blocks each with an ``ffn`` attribute).
-        fused_ffn: if False, the FFN swap is skipped (kept for symmetry
-            with future ``fused_qkv`` / ``fused_attn`` flags).
+            blocks each with ``ffn`` and ``attn`` attributes).
+        fused_ffn: if False, the FFN swap is skipped.
+        fused_qkv: if False, the attention swap is skipped.
 
     Returns:
         The same model, mutated in place. Returning is a convenience for
         chaining.
     """
-    if fused_ffn:
-        for block in model.layers:
-            if isinstance(block.ffn, TritonFFN):
-                continue  # idempotent
+    for block in model.layers:
+        if fused_ffn and not isinstance(block.ffn, TritonFFN):
             block.ffn = TritonFFN.from_eager(block.ffn)
+        if fused_qkv and not isinstance(block.attn, TritonAttention):
+            block.attn = TritonAttention.from_eager(block.attn)
     return model
 
 
@@ -59,28 +66,46 @@ def prewarm_triton_kernels(
         m_values: M values to prewarm. Default covers spec-decode K up to 7
             with one pending token; extend if running larger K.
     """
+    # FFN modules: bucket by (N, K) and fire each unique shape once per M.
     triton_ffns: list[TritonFFN] = [
         m for m in model.modules() if isinstance(m, TritonFFN)
     ]
-    if not triton_ffns:
-        return
-
-    # One representative module per unique (N, K) — autotune keys on shape,
-    # not on identity, so layers sharing dims (the typical case) only need
-    # to fire once per M.
-    by_shape: dict[tuple[int, int], TritonFFN] = {}
+    ffn_by_shape: dict[tuple[int, int], TritonFFN] = {}
     for ffn in triton_ffns:
         N, K = ffn.gate.weight.shape
-        by_shape.setdefault((N, K), ffn)
+        ffn_by_shape.setdefault((N, K), ffn)
+
+    # Attention modules: only the QKV matmul autotunes; bucket by
+    # (n_total, K) and call ``triton_fused_qkv`` directly so we don't pay
+    # the rest of the attention forward (RoPE / SDPA / KV-cache / o-proj).
+    from .fused_qkv import triton_fused_qkv
+
+    triton_attns: list[TritonAttention] = [
+        m for m in model.modules() if isinstance(m, TritonAttention)
+    ]
+    attn_by_shape: dict[tuple[int, int], TritonAttention] = {}
+    for attn in triton_attns:
+        n_total, K = attn.W_qkv.shape
+        attn_by_shape.setdefault((n_total, K), attn)
+
+    if not triton_ffns and not triton_attns:
+        return
 
     with torch.inference_mode():
-        for (N, K), ffn in by_shape.items():
+        for (N, K), ffn in ffn_by_shape.items():
             device = ffn.gate.weight.device
             dtype = ffn.gate.weight.dtype
             for M in m_values:
-                # Zeros are fine — autotune keys on shape; values don't matter.
                 x = torch.zeros((1, M, K), dtype=dtype, device=device)
                 _ = ffn(x)
+        for (n_total, K), attn in attn_by_shape.items():
+            device = attn.W_qkv.device
+            dtype = attn.W_qkv.dtype
+            for M in m_values:
+                x = torch.zeros((1, M, K), dtype=dtype, device=device)
+                _ = triton_fused_qkv(
+                    x, attn.W_qkv, n_q=attn.n_q, n_k=attn.n_k
+                )
 
     if torch.cuda.is_available():
         torch.cuda.synchronize()
