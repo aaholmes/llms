@@ -94,6 +94,16 @@ def main() -> None:
         print(f"loading draft:  {args.draft}")
         draft = _load(args.draft, dtype, device, use_triton=args.use_triton)
 
+    # Prewarm autotune AFTER all loads — Triton's do_bench allocates a 256 MB
+    # cache-flush buffer that won't fit alongside the transient state-dict
+    # duplicates that load_weights leaves on GPU until GC.
+    if args.use_triton:
+        from kernels import prewarm_triton_kernels
+
+        prewarm_triton_kernels(target)
+        if draft is not target:
+            prewarm_triton_kernels(draft)
+
     # Greedy baseline
     t0 = time.perf_counter()
     g = _run_greedy(target, prompt_ids, args.max_new)

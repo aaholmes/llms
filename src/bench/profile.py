@@ -609,6 +609,17 @@ def main() -> None:
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
 
+    # Prewarm autotune AFTER all loads complete and staged state-dicts have
+    # been GC'd — Triton's do_bench allocates a 256 MB cache-flush buffer
+    # that won't fit alongside the transient weight duplicates.
+    if args.use_triton:
+        from kernels import prewarm_triton_kernels
+
+        print("[profile] prewarming Triton autotune cache ...")
+        prewarm_triton_kernels(target)
+        if draft is not target:
+            prewarm_triton_kernels(draft)
+
     tok = AutoTokenizer.from_pretrained(args.target)
     prompt_ids = tok(args.prompt, return_tensors="pt").input_ids.to(device)
     args.prompt_tokens = int(prompt_ids.shape[1])

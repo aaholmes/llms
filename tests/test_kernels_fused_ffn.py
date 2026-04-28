@@ -19,6 +19,7 @@ from __future__ import annotations
 import pytest
 import torch
 import torch.nn.functional as F
+from torch import nn
 
 
 def _eager_gate_up_silu(
@@ -350,6 +351,54 @@ def test_apply_triton_kernels_idempotent(_draft_loaded_bf16):
     second = [b.ffn for b in model.layers]
     assert all(a is b for a, b in zip(first, second, strict=True))
     assert all(isinstance(b.ffn, TritonFFN) for b in model.layers)
+
+
+@pytest.mark.requires_draft
+@pytest.mark.requires_cuda
+@pytest.mark.requires_triton
+def test_prewarm_runs_clean(_draft_loaded_bf16):
+    """``prewarm_triton_kernels`` runs without error and does not perturb
+    forward outputs (autotune just picks a config; outputs are deterministic
+    once a config is selected).
+    """
+    from engine.model import Qwen3Model
+    from kernels.swap import apply_triton_kernels, prewarm_triton_kernels
+
+    model = (
+        Qwen3Model.from_loaded(_draft_loaded_bf16)
+        .to(dtype=torch.bfloat16, device="cuda")
+        .eval()
+    )
+    apply_triton_kernels(model)
+
+    input_ids = torch.tensor(
+        [[100, 200, 300, 400, 500, 600, 700, 800]], device="cuda"
+    )
+
+    with torch.inference_mode():
+        before = model(input_ids, model.alloc_cache(max_seq_len=32))
+
+    prewarm_triton_kernels(model)
+
+    with torch.inference_mode():
+        after = model(input_ids, model.alloc_cache(max_seq_len=32))
+
+    diff = (before.float() - after.float()).abs().max().item()
+    assert diff == 0.0, (
+        f"prewarm changed forward output by {diff} — autotune is supposed to be "
+        f"deterministic once a config is chosen"
+    )
+
+
+def test_prewarm_no_op_without_triton_modules():
+    """``prewarm_triton_kernels`` on a model with no Triton modules is a no-op
+    (covers the M2 dev path where the kernel package isn't wired in)."""
+    from kernels.swap import prewarm_triton_kernels
+
+    plain = nn.Sequential(nn.Linear(4, 4))  # no .layers, no TritonFFN
+    # Should not raise even though `plain.layers` doesn't exist — function
+    # walks `model.modules()`.
+    prewarm_triton_kernels(plain)
 
 
 # ----- Step 6: greedy E2E parity --------------------------------------------
