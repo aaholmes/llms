@@ -1,2 +1,15 @@
 MOTIVATION.md
 CLAUDE.md
+
+.venv/
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.python-version
+.DS_Store
+
+experiments/**/*.json
+experiments/**/*.pt
+experiments/**/*.csv
+!experiments/**/.gitkeep
