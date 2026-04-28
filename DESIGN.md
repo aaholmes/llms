@@ -1,177 +1,150 @@
-# Async Speculative Decoding on a Single GPU
+# Post-hoc MHA→MLA Conversion on a Single GPU
 
-**A characterization of HBM-bandwidth contention with CUDA Green Contexts**
+**Activation-aware SVD with partial-RoPE for KV-cache compression of an existing transformer, validated on a from-scratch inference engine**
 
 ---
 
 ## One-line pitch
 
-A from-scratch single-GPU asynchronous speculative-decoding inference engine, designed to characterize when explicit SM partitioning (via CUDA Green Contexts) beats letting the CUDA scheduler interleave streams of draft and target model execution under HBM-bandwidth-bound autoregressive decoding.
+Convert an existing MHA/GQA-architecture LLM (Qwen3-4B) to Multi-head Latent Attention (MLA) post-hoc, without retraining, via activation-aware SVD with partial-RoPE; validate on a from-scratch single-GPU inference engine; characterize how compression ratio, speculative-decode acceptance rate, and perplexity interact at fixed 16 GB VRAM.
 
 ---
 
 ## Problem statement
 
-Speculative decoding accelerates autoregressive LLM inference by having a small **draft model** propose K future tokens that a larger **target model** verifies in a single batched forward pass. Production deployments typically take one of three paths:
+LLM inference on a single consumer GPU is bottlenecked by KV-cache memory and HBM bandwidth. Multi-head Latent Attention (MLA), introduced by DeepSeek-V2 and used by every 2026 frontier model (DeepSeek V3/V4, Kimi K2.6, Nemotron 3), compresses the KV cache by 4–8× by absorbing K and V projections into a low-rank latent. The vast existing population of MHA/GQA models — Llama-3, Qwen3, Mistral — predates MLA and ships with full-size KV caches.
 
-1. **Multi-GPU**: draft on GPU 0, target on GPU 1. Eliminates resource contention; requires expensive hardware.
-2. **Single-GPU sequential**: draft for K tokens, then target verifies. Trivial to implement; leaves significant wall-clock idle time on the GPU.
-3. **Tiny draft heads** (Medusa, Eagle): replace the draft model with output heads grafted onto the target. Avoids contention because the "draft" is essentially free.
+**Post-hoc conversion of MHA → MLA without retraining** is an emerging research line (MHA2MLA, Liu et al. 2025; SVD-LLM family; activation-aware variants). The technique uses calibration-data-weighted SVD to find the best low-rank approximation of the K/V projections.
 
-The fourth path — **single-GPU async**, where draft and target execute concurrently — is comparatively under-studied. The reason is non-obvious: in autoregressive decoding with small batch size, models are not compute-bound but **memory-bandwidth-bound**. Both draft and target read weights from the same High-Bandwidth Memory (HBM) pool. Naively running them on two CUDA streams therefore shares scarce HBM bandwidth, and the result can match, slightly improve on, or even regress versus sequential execution.
+The catch is RoPE. Position-dependent rotation prevents the "absorb" trick that fuses Q-projection with attention into a single matmul on the compressed latent. The standard workaround, **partial-RoPE**, splits each head's dimension into a NoPE latent-absorbed subspace and a small RoPE-only concatenated subspace — the design used by DeepSeek-V3.
 
-This project asks: **under what conditions does explicit Streaming Multiprocessor (SM) partitioning between draft and target outperform the default kernel scheduler?**
+This project asks: **how cleanly can a public MHA/GQA model be converted to MLA without retraining, and how does the resulting KV compression interact with speculative decoding at a fixed 16 GB VRAM budget?**
 
 ---
 
 ## Hypothesis
 
-On a single consumer GPU running autoregressive decoding, explicit SM partitioning via CUDA Green Contexts can outperform default scheduling under regimes determined by:
+A post-hoc MHA→MLA conversion of Qwen3-4B via activation-aware SVD with partial-RoPE achieves at least **4× KV-cache compression** with **≤2% perplexity degradation** on standard benchmarks (HellaSwag, WikiText-103, MMLU subset), without healing finetune.
 
-- **Relative draft/target model size** — at extreme size ratios, the smaller model gets starved or the larger model gets bandwidth-saturated regardless of scheduling.
-- **L2 cache fit** — if the target model's working set fits within an L2 partition implied by the SM split, partitioning may unlock cache reuse that interleaving cannot.
-- **Compute-to-bandwidth ratio per kernel** — kernels that are more compute-bound (e.g., long-prompt prefill) tolerate concurrent execution differently than those that are bandwidth-bound (decode steps).
-- **Cross-stream synchronization overhead** — naive two-stream execution still requires inter-stream sync points (verify before sample, sample before next-K draft) that may amortize differently with partitioning.
+KV compression and speculative decoding interact in two opposing ways:
 
-The expected phase diagram has at least two regimes:
+- **Pro:** smaller KV footprint shifts more of the decode-step memory budget to weights, improving HBM cache locality and potentially raising tok/s for both target and draft.
+- **Con:** lossy K/V reconstruction can subtly shift the target's logit distribution, lowering draft-target agreement and hence the spec-decode acceptance rate.
 
-- **Regime 1**: small/medium draft size, decode-only workload → naive two-stream async ≈ sequential (HBM bound). Partitioning helps modestly via L2 isolation.
-- **Regime 2**: very small draft (heads) or large prefill component → naive async > sequential. Partitioning marginal.
-
-Identifying the boundary is the contribution.
+The phase diagram across compression ratio × draft-K × VRAM ceiling is the contribution.
 
 ---
 
 ## Approach
 
-- **Host language**: PyTorch. Manual forward pass (no `huggingface/transformers` modeling code in the hot path), HF weights loaded directly.
-- **Hot-path kernels**: Triton (one custom kernel in Stage A; possibly two in Stage C if profiling indicates).
-- **SM partitioning**: CUDA Green Contexts via the CUDA driver API. Accessed from Python via [`cuda-python`](https://nvidia.github.io/cuda-python/).
-- **Profiling**: NVIDIA Nsight Compute for kernel-level metrics (HBM throughput, L2 hit rate, SM occupancy). `nvidia-smi dmon` for sanity checks. PyTorch profiler for Python-side overhead.
-- **Empirical method**: factorial sweep over SM partition ratios × model size pairs × batch sizes × acceptance rates, with each cell yielding tok/s and a profile vector.
+- **Host language:** PyTorch with manual forward pass (no `transformers.AutoModelForCausalLM` in the hot path).
+- **Hot-path kernel:** one custom Triton kernel, target chosen by Stage A.5 profiling (likely fused MLA-style attention).
+- **MLA conversion:** activation-aware SVD with calibration-data-weighted truncation; partial-RoPE split following DeepSeek-V3's NoPE-latent + RoPE-concat design.
+- **Calibration data:** ~1k samples from an instruction-tuned set (e.g., Dolly-15k); per-layer input covariances captured during forward passes through the original model.
+- **No healing finetune in v1.** Healing finetune (LoRA-style) is a stretch milestone.
+- **Profiling:** `torch.profiler` for Python-side, NVIDIA Nsight Compute for kernel-level (HBM throughput, L2 hit rate, SM occupancy).
 
 ---
 
 ## Stages
 
-### Stage A — Sequential baseline (~2 weeks, 30–40 hrs)
+### Stage A — Inference engine (DONE)
 
-Working artifact: a PyTorch implementation of sequential speculative decoding for **Llama-3.2-1B** (target) with **Qwen-2.5-0.5B** as draft.
+A working from-scratch sequential-speculative-decoding engine for Qwen3-4B (target) + Qwen3-0.6B (draft). Manual forward pass, contiguous KV cache, greedy verification.
 
-Required pieces:
+Status (April 2026):
+- Manual Qwen3 forward pass — RMSNorm, RoPE, GQA + QK-norm, SwiGLU, decoder block. Bit-exact with `transformers.AutoModelForCausalLM` on Qwen3-0.6B.
+- Sequential speculative decode with K ∈ {1,3,4,5,7}; self-spec produces token-for-token plain greedy in FP32.
+- 34 passing tests on M2 Mac (CPU/MPS, BF16 + FP32).
+- Demo CLI (`bench/demo.py`) for end-to-end runs.
 
-1. **Model loading**: Pull HF weights, instantiate manual forward pass. No `model.generate()`, no `transformers.LlamaForCausalLM` in the hot path.
-2. **Decoder block**: RoPE, Grouped-Query Attention (GQA), RMSNorm, SwiGLU FFN.
-3. **KV cache**: contiguous (per-layer `[batch, num_kv_heads, max_seq_len, head_dim]`). Paged variant deferred to optional stretch.
-4. **Sampling**: greedy, top-k, top-p (nucleus), temperature.
-5. **Speculative decode loop**:
-   - Draft proposes K tokens autoregressively (K ∈ {3, 4, 5, 7}).
-   - Target verifies all K + 1 in a single forward pass.
-   - Accept the longest agreeing prefix; sample the corrected token from the target distribution.
-6. **One Triton kernel** for the identified hot path. Candidates:
-   - Fused scaled-dot-product attention with KV cache (likely choice).
-   - Fused logit-sample-decode step (top-p in-kernel).
-   - Decision deferred until Stage A profiling identifies the actual bottleneck.
+Stage A is the validation harness for everything that follows — every conversion or compression variant is checked by running it end-to-end through this engine.
 
-**Stage A success criteria**:
+### Stage A.5 — One Triton kernel (~1 week, GPU desktop)
 
-- Llama-3.2-1B greedy generation matches HF `generate()` token-for-token on a fixed prompt set.
-- Speculative speedup ≥ 1.5× over greedy on a representative prompt distribution.
-- Triton kernel matches or beats `torch.nn.functional.scaled_dot_product_attention` on the target model's shapes.
+Profile the engine on a CUDA GPU; identify the actual decode-step hot path (likely fused SDPA-with-KV-cache, but **decision deferred to profile data**); implement and microbenchmark a single Triton kernel.
 
-### Stage B — Validation spike (~2 days)
+**Stage A.5 success criteria:**
+- Triton kernel ≥ `torch.nn.functional.scaled_dot_product_attention` on target shapes (microbenchmark).
+- E2E speedup of ≥1.5× over the un-Triton'd Stage A baseline on Qwen3-4B greedy.
 
-**Before** committing to Stage C, run a controlled experiment to validate the central premise.
+### Stage B — MLA conversion (~3–4 weeks)
 
-Setup: draft and target on two CUDA streams, no partitioning. Same problem instance as Stage A baseline. Measure:
+Build a `MLAttention` module that drops into the existing decoder block in place of `Attention`, parameterised by (compression ratio, NoPE/RoPE split).
 
-- End-to-end tok/s, sequential vs naive async.
-- HBM bandwidth utilization (Nsight Compute).
-- L2 cache hit rate per stream.
-- Achieved SM occupancy.
+1. **Calibration pipeline:** forward pass Qwen3-4B over ~1k calibration samples; capture per-layer input activations and compute covariances XXᵀ.
+2. **Activation-aware SVD:** for each layer's K and V projections, compute the rank-r approximation that minimises reconstruction error weighted by the activation covariance (the SVD-LLM-family formulation).
+3. **Partial-RoPE split:** decompose each head's `head_dim` into `d_nope + d_rope`. NoPE subspace projects through the compressed latent; RoPE subspace runs through a small uncompressed K projection that is then RoPE-rotated and concatenated for attention.
+4. **Eval:** perplexity on WikiText-103, accuracy on HellaSwag and an MMLU subset, KV memory in bytes/token, throughput. Compare original Qwen3-4B vs MLA-converted variants at compression ratios {2×, 4×, 6×, 8×}.
+5. **Stretch:** healing finetune via LoRA on the calibration set, ~1k–10k steps. Re-eval.
 
-Three possible outcomes — each pivots the project:
+**Stage B success criteria:**
+- ≥4× KV-cache compression with ≤2% perplexity degradation on Qwen3-4B (no FT).
+- Reproducible conversion script: `python -m specd.mla.convert Qwen/Qwen3-4B --rank 128 --d_rope 32 --calib dolly-1k`.
+- Token-for-token greedy match between converted MLA model and a reference HF implementation of MLA at the same compression rank (sanity check on the math).
 
-| Outcome | Interpretation | Pivot |
-|---|---|---|
-| Naive async ≈ sequential | HBM-bound. Streams compete for the same finite resource. | **Proceed to Stage C.** SM partitioning has well-defined upside via L2 isolation. |
-| Naive async > sequential by ≥10% | Compute headroom exists; streams successfully parallelize. | Stage C value reduced. Pivot to characterizing *why* it works (cache effects? compute overlap?), or pivot to a different research question (e.g., L2-aware scheduling). |
-| Naive async < sequential | Scheduler thrash dominates concurrent execution. | Stage C upside is largest. Partitioning should clearly win. |
+### Stage C — Interaction characterization (~2 weeks)
 
-Stage B is the cheapest insurance against committing four weeks to a question with a boring answer.
+Run the joint sweep at fixed 16 GB VRAM ceiling.
 
-### Stage C — Async with SM partitioning + characterization (~3–4 weeks)
+Axes:
+- KV compression ratio: {1× (baseline MHA), 2×, 4×, 6×, 8×}.
+- Speculative-decode K: {3, 5, 7}.
+- (Optional) INT4 quantization of weights via `bitsandbytes` or hand-rolled.
 
-Build the partitioned engine and run the characterization sweep.
+Metrics per cell: tok/s, acceptance rate, perplexity, max usable sequence length, peak VRAM.
 
-1. **Plumbing**: integrate `cuda-python` for Green Context creation and per-stream binding.
-2. **Engine**: launch draft kernels on context A (K SMs) and target kernels on context B (N − K SMs). Manage stream synchronization at speculative-decode boundaries (verify → sample → next-K draft).
-3. **Characterization sweep** — factorial design over:
-   - SM split ratios: {25/75, 33/67, 50/50, 67/33, 75/25} (constrained by Blackwell SM granularity).
-   - Draft K: {3, 5, 7}.
-   - Target/draft model size pairs: {1B/0.5B, 3B/0.5B, 8B/1B if VRAM permits}.
-   - Batch size: {1, 2, 4}.
-   - Prefill vs decode-only.
-4. **Outputs**:
-   - Phase diagram (heatmap) of partitioning speedup over naive async, across the 5+ axes.
-   - Per-cell Nsight Compute report capturing HBM utilization, L2 hit rate, SM occupancy.
-   - 5–10 page writeup with charts. Target venue: workshop paper at MLSys / EuroSys / MLArchSys, or a substantive blog post.
+Output:
+- Pareto frontier chart (throughput vs perplexity, parameterised by compression).
+- 5–10 page writeup. Target: workshop / blog post.
+- Reproducible code + cached calibration data + per-cell logs.
 
-**Stage C success criteria**:
-
-- A characterization that an external reviewer could reproduce with the published code.
-- At least one regime where SM partitioning produces ≥10% speedup over naive async (otherwise the writeup is "negative result, but here's what we learned" — still publishable, less interesting).
-- A predictive model (even informal) for when partitioning is expected to win.
+**Stage C success criteria:**
+- Phase diagram showing the regime where MLA compression is *complementary* to speculative decoding versus where compression's KV-locality benefit is offset by acceptance-rate degradation.
+- One headline number for the resume / interview pitch (e.g. "4× KV compression on Qwen3-4B, 30% throughput improvement at fixed VRAM, ≤2% perplexity loss").
 
 ---
 
 ## Hardware
 
-- **Primary target**: RTX 5060 Ti 16GB (Blackwell, SM 10.0+).
-- **VRAM budget**: 16 GB. Comfortably fits Llama-3.2-1B (FP16 ≈ 2.5 GB) + Qwen-0.5B (≈1 GB) + KV caches + activations. Larger pairs (3B/0.5B, 8B/1B) require quantization or offloading.
-
-**Pre-flight checks before committing to Stage C**:
-
-- CUDA driver ≥ 12.4 installed (Green Contexts requirement).
-- `cuda-python` package installs and imports cleanly.
-- Verify Green Context feature support on the specific SKU. **Some Green Context features are SM 9.0+ datacenter-only** (H100/B100 class). Confirm via NVIDIA developer docs and a minimal "create-and-bind" smoke test before designing around the API.
-- Nsight Compute installed and functional with the consumer driver.
-
-If any pre-flight check fails, the project pivots to a non-Green-Context partitioning mechanism (CUDA streams + `cudaStreamAttrPriority`, or MPS) — the research question survives, the implementation differs.
+- **Primary target:** RTX 5060 Ti 16 GB (Blackwell, SM 10.0+).
+- **VRAM budget:** 16 GB. Qwen3-4B in BF16 ≈ 8 GB; baseline KV at long context dominates the rest. The 16 GB ceiling is the *forcing function* for the whole study — it makes "compress to fit" a real engineering constraint, not an academic one.
+- Development on a 16 GB MacBook M2 (MPS / CPU for primitives, no Triton/CUDA). Stage A.5 onward requires the desktop.
 
 ---
 
-## Repo layout (proposed)
+## Repo layout
 
 ```
 llms/
-├── DESIGN.md                  # this file (public)
-├── MOTIVATION.md              # private
-├── README.md                  # short summary, links to DESIGN
+├── DESIGN.md                       # this file (public)
+├── README.md                       # short summary
 ├── pyproject.toml
 ├── src/
 │   ├── engine/
-│   │   ├── model.py           # manual Llama/Qwen forward pass
-│   │   ├── attention.py       # GQA + RoPE + KV cache
-│   │   ├── kv_cache.py        # contiguous (Stage A) and paged (stretch)
-│   │   ├── sampler.py         # greedy / top-k / top-p / temperature
-│   │   └── spec_decode.py     # speculative decoding loop
+│   │   ├── model.py                # manual Qwen3 forward pass
+│   │   ├── attention.py            # GQA + RoPE + KV cache (Stage A)
+│   │   ├── mla.py                  # Stage B: MLAttention module
+│   │   ├── kv_cache.py
+│   │   ├── sampler.py
+│   │   ├── spec_decode.py
+│   │   └── weights.py
 │   ├── kernels/
-│   │   └── attention_triton.py # the hot-path Triton kernel
-│   ├── partitioning/
-│   │   ├── green_ctx.py       # cuda-python Green Context wrapper
-│   │   └── stream_mgr.py      # stream + context lifecycle
+│   │   └── attention_triton.py     # Stage A.5 hot-path kernel
+│   ├── mla/                        # Stage B conversion pipeline
+│   │   ├── calibrate.py            # collect activation covariances
+│   │   ├── svd.py                  # activation-aware SVD
+│   │   └── convert.py              # CLI: produce MLA-converted state dict
 │   └── bench/
-│       ├── microbench.py      # individual kernel benches
-│       ├── e2e.py             # end-to-end tok/s
-│       └── sweep.py           # Stage C factorial sweep driver
+│       ├── demo.py
+│       ├── microbench.py
+│       ├── profile.py
+│       └── e2e.py                  # Stage C sweep driver
 ├── experiments/
-│   ├── stage_a/               # baseline numbers + plots
-│   ├── stage_b/               # validation spike data
-│   └── stage_c/               # characterization sweep + phase diagrams
+│   ├── stage_a/
+│   ├── stage_b/                    # conversion runs + eval results
+│   └── stage_c/                    # joint-sweep data + figures
 ├── writeup/
-│   ├── paper.tex              # workshop paper draft
-│   └── figures/
 └── tests/
 ```
 
@@ -179,13 +152,10 @@ llms/
 
 ## Open questions
 
-These need answers during implementation; flagged here to prevent surprise mid-stage.
-
-- **Blackwell consumer Green Context support**: which features are available on RTX 5060 Ti? (Pre-flight check above.)
-- **L2 partitioning controllability**: is L2 cache split a user-tunable knob alongside SM split, or implicit / driver-managed?
-- **Triton-Green-Context interaction**: does Triton respect a Green Context binding, or does it launch on the parent context regardless?
-- **Hot-path kernel choice**: attention vs sample-decode? Resolve via Stage A profiling, not upfront speculation.
-- **KV cache pressure**: at what target-model size does KV cache start crowding HBM enough that partitioning gains evaporate?
+- **Calibration sensitivity:** how much does calibration-set composition (instruction-tuned vs base, ~100 vs ~10k samples) move the no-FT perplexity?
+- **Optimal partial-RoPE split:** what `(d_nope, d_rope)` minimizes perplexity at a fixed total head-dim budget?
+- **Compression × spec-decode interaction:** does smaller KV improve acceptance via better cache locality, hurt it via lossy K/V mismatch with the draft, or both depending on regime?
+- **Rank choice per layer:** uniform rank vs adaptive (some layers need more)? SVD-LLM literature is split.
 
 ---
 
@@ -193,32 +163,36 @@ These need answers during implementation; flagged here to prevent surprise mid-s
 
 | Risk | Mitigation |
 |---|---|
-| Scope explosion (research arcs always overrun) | Strict stage gates. Stage A must ship a working artifact before Stage B begins. Stage B's pivot rules are written down; do not skip the spike. |
-| Green Contexts unavailable on consumer Blackwell | Pre-flight smoke test before Stage C. Fallback: stream priority + MPS. Research question survives. |
-| Stage B finds the contention question is uninteresting | Stage A engine alone is still a tellable artifact. Pivot Stage C to a related question (paged KV cache contention, MoE routing scheduling). |
-| `cuda-python` driver-API friction | Budget 1 day of plumbing work in Stage C. Encapsulate in `partitioning/green_ctx.py` so the rest of the engine doesn't need to care. |
-| Negative result in characterization | Negative results are publishable in systems venues if the methodology is rigorous. The phase diagram itself is the contribution, regardless of which regions favor partitioning. |
+| Stage B no-FT perplexity is too high (>5% loss at 4×) | Bring forward the LoRA healing-finetune stretch milestone; it's the standard remedy and adds ~1 week. |
+| Activation-aware SVD turns out to require a finetune harness we don't have | Use a published recipe (e.g. MHA2MLA reference code) rather than reinventing; budget 3 days of plumbing. |
+| Stage C interaction story is uninteresting (compression and spec decode are independent) | The Pareto chart itself is still the deliverable — a "they're independent" finding is publishable. Pivot writeup accordingly. |
+| 16 GB VRAM proves too tight even after compression | Drop to Qwen3-1.7B target or cap sequence length. The technique generalizes; the headline number changes. |
 
 ---
 
-## Success criteria (overall)
+## Future extensions
 
-- **Stage A**: working speculative decode, ≥1.5× greedy speedup, one custom Triton kernel.
-- **Stage B**: clear pivot decision based on profile data.
-- **Stage C**: phase diagram + writeup + reproducible code.
-- **Artifact quality**: an external systems researcher should be able to reproduce the central plots from the published code in <1 day.
+The following directions are deferred — each would extend the project past the current 6–10 week budget but is a natural follow-on:
+
+- **SM partitioning study** *(the original direction of this design doc, archived in [`DESIGN-sm-partitioning.md`](./DESIGN-sm-partitioning.md))* — characterize when explicit SM partitioning via CUDA Green Contexts beats default kernel scheduling for two-stream async speculative decoding under HBM contention. Independent research question; uses the same engine substrate.
+- **Probabilistic spec-decode verify** (Leviathan et al.) — replace greedy verification with proper rejection sampling. Required for non-greedy (sampled) generation.
+- **INT4/FP8 weight quantization** stacked on MLA compression. SVD-LLM literature suggests quantization wins below ~4× compression but stacks usefully above.
+- **Healing finetune** as a first-class stage rather than a stretch — small LoRA training run on calibration data to recover the last 1–2% perplexity.
+- **Paged KV cache** (vLLM-style) for multi-batch serving.
+- **Hybrid-architecture extension** — adapt the conversion pipeline for hybrid linear/full attention models (Qwen3.5, LFM2, Nemotron 3).
 
 ---
 
 ## References
 
+- DeepSeek-AI. "DeepSeek-V2: A Strong, Economical, and Efficient Mixture-of-Experts Language Model." 2024.
+- DeepSeek-AI. "DeepSeek-V3 Technical Report." 2024.
+- Liu et al. "MHA2MLA: Post-Hoc Conversion of Multi-Head Attention to Multi-head Latent Attention." 2025.
+- Wang et al. "SVD-LLM: Truncation-aware Singular Value Decomposition for Large Language Model Compression." 2024.
+- Lin et al. "AWQ: Activation-aware Weight Quantization for LLM Compression and Acceleration." MLSys 2024.
 - Leviathan, Kalman, Matias. "Fast Inference from Transformers via Speculative Decoding." ICML 2023.
-- Cai et al. "Medusa: Simple LLM Inference Acceleration Framework with Multiple Decoding Heads." 2024.
-- Li et al. "EAGLE / EAGLE-2: Speculative Sampling Requires Rethinking Feature Uncertainty." 2024.
-- Fu et al. "Lookahead Decoding." 2024.
-- Kwon et al. "Efficient Memory Management for Large Language Model Serving with PagedAttention." SOSP 2023.
-- NVIDIA. CUDA Green Contexts documentation. CUDA Toolkit 12.4+.
 - Dao. "FlashAttention-2: Faster Attention with Better Parallelism and Work Partitioning." 2023.
+- NVIDIA. CUDA Green Contexts documentation. CUDA Toolkit 12.4+.
 
 ---
 
