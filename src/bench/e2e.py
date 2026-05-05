@@ -240,9 +240,9 @@ def phase_a_hf(
 
 def phase_b_ours_eager(
     *, target_id: str, draft_id: str, prompts_ids: list[torch.Tensor],
-    max_new: int, K: int, dtype: torch.dtype, device: str,
+    max_new: int, K_values: list[int], dtype: torch.dtype, device: str,
 ) -> list[ResultRow]:
-    """Our engine, no Triton kernels: greedy + spec K=4."""
+    """Our engine, no Triton kernels: greedy + spec K-sweep."""
     print(f"[e2e/B] loading ours target {target_id} ...")
     target = _load_ours(target_id, dtype, device)
     _free()
@@ -256,7 +256,8 @@ def phase_b_ours_eager(
 
     print("[e2e/B] warmup ...")
     _our_greedy(target, prompts_ids[0][:, :8], max_new=4)
-    _our_spec(target, draft, prompts_ids[0][:, :8], max_new=4, K=K)
+    for K in K_values:
+        _our_spec(target, draft, prompts_ids[0][:, :8], max_new=4, K=K)
     if torch.cuda.is_available():
         torch.cuda.synchronize()
 
@@ -271,38 +272,41 @@ def phase_b_ours_eager(
                 f"median {statistics.median(g_walls):.2f}s"
             )
 
-    print(f"[e2e/B] spec K={K}: {len(prompts_ids)} prompts × {max_new} tokens ...")
-    s_walls: list[float] = []
-    s_accs: list[float] = []
-    s_rounds: list[int] = []
-    for i, ids in enumerate(prompts_ids):
-        result, wall = _time_generation(
-            lambda: _our_spec(target, draft, ids, max_new=max_new, K=K)
-        )
-        _, stats = result
-        s_walls.append(wall)
-        s_accs.append(stats.acceptance_rate)
-        s_rounds.append(stats.rounds)
-        if (i + 1) % 20 == 0:
-            print(
-                f"[e2e/B]   spec   {i + 1}/{len(prompts_ids)}: "
-                f"median {statistics.median(s_walls):.2f}s, "
-                f"acc {statistics.median(s_accs):.1%}"
-            )
+    rows: list[ResultRow] = [_make_row("ours_greedy_eager", g_walls, max_new)]
 
-    rows = [
-        _make_row("ours_greedy_eager", g_walls, max_new),
-        _make_row(
-            f"ours_spec_eager_K{K}",
-            s_walls,
-            max_new,
-            extra={
-                "acceptance_rate_median": statistics.median(s_accs),
-                "rounds_median": statistics.median(s_rounds),
-                "K": K,
-            },
-        ),
-    ]
+    for K in K_values:
+        print(
+            f"[e2e/B] spec K={K}: {len(prompts_ids)} prompts × {max_new} tokens ..."
+        )
+        s_walls: list[float] = []
+        s_accs: list[float] = []
+        s_rounds: list[int] = []
+        for i, ids in enumerate(prompts_ids):
+            result, wall = _time_generation(
+                lambda: _our_spec(target, draft, ids, max_new=max_new, K=K)
+            )
+            _, stats = result
+            s_walls.append(wall)
+            s_accs.append(stats.acceptance_rate)
+            s_rounds.append(stats.rounds)
+            if (i + 1) % 20 == 0:
+                print(
+                    f"[e2e/B]   spec K={K} {i + 1}/{len(prompts_ids)}: "
+                    f"median {statistics.median(s_walls):.2f}s, "
+                    f"acc {statistics.median(s_accs):.1%}"
+                )
+        rows.append(
+            _make_row(
+                f"ours_spec_eager_K{K}",
+                s_walls,
+                max_new,
+                extra={
+                    "acceptance_rate_median": statistics.median(s_accs),
+                    "rounds_median": statistics.median(s_rounds),
+                    "K": K,
+                },
+            )
+        )
 
     same_model = draft is target
     del target
@@ -571,7 +575,7 @@ def main() -> None:
     p.add_argument("--max-new", type=int, default=200)
     p.add_argument(
         "--K", type=int, nargs="+", default=[3, 4, 5, 7],
-        help="Spec K values for the Triton branch sweep. Phase B always uses K=4.",
+        help="Spec K values; swept on both eager (Phase B) and Triton (Phase C).",
     )
     p.add_argument(
         "--phase", type=str, nargs="+", default=["A", "B", "C"], choices=["A", "B", "C"],
@@ -637,7 +641,7 @@ def main() -> None:
                 draft_id=args.draft,
                 prompts_ids=prompts_ids,
                 max_new=args.max_new,
-                K=4,
+                K_values=list(args.K),
                 dtype=dtype,
                 device=device,
             )
