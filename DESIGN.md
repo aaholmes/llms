@@ -53,21 +53,46 @@ A priori, the sign of the interaction is unclear in any of these regimes. At 4×
 
 A working from-scratch sequential-speculative-decoding engine for Qwen3-4B (target) + Qwen3-0.6B (draft). Manual forward pass, contiguous KV cache, greedy verification.
 
-Status (April 2026):
+Status (May 2026):
 - Manual Qwen3 forward pass — RMSNorm, RoPE, GQA + QK-norm, SwiGLU, decoder block. Bit-exact with `transformers.AutoModelForCausalLM` on Qwen3-0.6B.
-- Sequential speculative decode with K ∈ {1,3,4,5,7}; self-spec produces token-for-token plain greedy in FP32.
-- 34 passing tests on M2 Mac (CPU/MPS, BF16 + FP32).
-- Demo CLI (`bench/demo.py`) for end-to-end runs.
+- Sequential speculative decode characterized over K ∈ {1,2,3,4,5,7} on RTX 5060 Ti 16 GB BF16, 100 Dolly-15k prompts × 200 generated tokens. **Headline: 1.29× spec/greedy at K=2–3 with Qwen3-0.6B draft (50.3 vs 38.9 tok/s).** Acceptance rate peaks at 78.9% at K=1 but per-round overhead wins; falls to 42.7% at K=7. Self-spec produces token-for-token plain greedy in FP32.
+- Eager greedy matches HuggingFace `AutoModelForCausalLM` with `use_cache=True` to one decimal (38.9 tok/s, 1.00× HF) — confirms the manual forward pass is not pathologically slow despite no `torch.compile`.
+- 79 passing tests on M2 Mac and CUDA desktop (CPU/MPS, BF16 + FP32).
+- E2E bench CLI (`bench.e2e`) and demo CLI (`bench.demo`) for reproducible runs.
 
 Stage A is the validation harness for everything that follows — every conversion or compression variant is checked by running it end-to-end through this engine.
 
-### Stage A.5 — One Triton kernel (~1 week, GPU desktop)
+### Stage A.5 — One Triton kernel (DONE)
 
-Profile the engine on a CUDA GPU; identify the actual decode-step hot path (likely fused SDPA-with-KV-cache, but **decision deferred to profile data**); implement and microbenchmark a single Triton kernel.
+Profile the engine on a CUDA GPU; identify the actual decode-step hot path; implement and microbenchmark a Triton kernel.
 
-**Stage A.5 success criteria:**
-- Triton kernel ≥ `torch.nn.functional.scaled_dot_product_attention` on target shapes (microbenchmark).
-- E2E speedup of ≥1.5× over the un-Triton'd Stage A baseline on Qwen3-4B greedy.
+**Stage A.5 success criteria (original):**
+- Triton kernel ≥ eager equivalent on target shapes (microbenchmark): **MET**.
+- E2E speedup of ≥1.5× over the un-Triton'd Stage A baseline on Qwen3-4B greedy: **NOT MET** (best result 1.04× greedy, 0.97× on the spec hot path).
+
+#### Stage A.5 retrospective
+
+Profile data on Qwen3-4B BF16 decode (`experiments/stage_a/profile_summary.md`) showed matmul = 77.4% of wall time, attention = 1.5%, RMSNorm = 5%. Hot path is *not* attention but the per-step linear projections — at batch=1 these are GEMV (M=1) operations that are HBM-bandwidth-bound rather than compute-bound. Two fused Triton kernels were shipped:
+
+- **A.5a — fused gate-up-silu** (`07fe2d6`, [src/kernels/fused_ffn.py](./src/kernels/fused_ffn.py)). Computes `silu(x @ Wg.T) * (x @ Wu.T)` in one launch, fusing the SwiGLU activation into the GEMV. Microbench: 1.05× over eager 2-linear+silu on Qwen3-4B FFN shapes.
+- **A.5b — fused QKV projection** (`7af0978`, [src/kernels/fused_qkv.py](./src/kernels/fused_qkv.py)). Pre-concatenates Wq/Wk/Wv into a single buffer and runs one matmul. Microbench: 1.50–2.98× over eager-3-separate-Linears, but **ties** an eager-concat-Linear (single `nn.Linear` with split) at all M ∈ {1..8} — the win is from concatenation, not from Triton.
+
+Both kernels cleared their microbench gates but did **not** translate to e2e wins on the spec-decode hot path. At K=4: eager spec = 49.8 tok/s, kerneled spec = 43.7 tok/s (kernel **hurts** by 0.88×). At K=2 and K=3 the same pattern holds.
+
+**Mechanism inventory** (in descending order of estimated contribution):
+1. **Per-call Python/Triton dispatch overhead × ~14k spec calls per 200-token generation.** Each spec round makes K+1 forward passes through 28 decoder layers × 5 ops = ~140 ops/round; at K=4 that's ~700 dispatches per round × 60 rounds ≈ 42k dispatches. Triton's per-call launch + autotune-cache lookup is small but accumulates; cuBLAS via PyTorch's caching dispatcher is faster on the per-call axis.
+2. **BF16 reduction-order non-associativity drops draft/target argmax agreement.** Acceptance rate at K=4 fell from 58.3% (eager) to 54.5% (Triton); at K=3 from 64.5% to 60.8%. Triton's tiling produces a different reduction order than cuBLAS, occasionally flipping argmax under BF16. Greedy verify is unforgiving — a single argmax flip rejects the rest of the round.
+3. **The microbench wins were small in absolute terms (~6-12 µs/call).** At ~120 dispatches per token × 200 tokens × 6 µs = ~144 ms, vs ~5 s of decode wall time per prompt. The maximum theoretical e2e win was ~3% even before factoring in items (1) and (2).
+4. **cuBLAS gemvx on M=1 BF16 GEMV is already near peak HBM bandwidth.** RTX 5060 Ti peak HBM ≈ 448 GB/s; greedy decode at 38.9 tok/s × 8 GB model ≈ 311 GB/s = ~70% of peak. Custom Triton can shave a few percent off; it cannot shave 50%.
+
+**Falsified hypotheses (worth recording as warnings to future-self):**
+- *"A bigger draft model will lift acceptance enough to clear 1.5×."* Tried Qwen3-1.7B as draft; acceptance climbed (64.5% → 70.3% at K=3) but per-step compute cost grew faster (1.29× → 1.19× speedup). The 0.6B draft beats the 1.7B at every K tested.
+- *"Triton kernels that win in microbench will help spec decode if we reduce overhead."* Adding an autotune-cache prewarm (`8566854`) recovered some of the gap (25.9 → 29.2 tok/s on a 64-token demo), but the underlying mechanisms above kept Triton spec ≤ eager spec on a 100-prompt × 200-token formal bench.
+- *"K=4 is roughly optimal for 0.6B/4B at greedy verify."* (DESIGN.md Stage C originally specified K ∈ {3,5,7}, not K ∈ {1,2,3,4,5,7}.) Actual optimum is K=2–3; K=4 is suboptimal by ~3-4%; K=1 is worse than K=2 because per-round overhead dominates one drafted token.
+
+**Implications for future stages:**
+- Stage C's K axis should be {2, 3, 5} not {3, 5, 7} — K=2 and K=3 are tied within run-to-run noise and either is a defensible choice; K=7 is below the per-round-overhead breakeven.
+- Stage B / C's optimization budget should not be spent on more Triton kernels for batch=1 GEMV; the regime is HBM-bound and cuBLAS is already near peak. Real follow-on candidates if more spec speedup is wanted: (a) **CUDA Graphs** to amortize the ~14k dispatch overhead; (b) **probabilistic verify** (Leviathan et al.) to recover the BF16-induced acceptance loss; (c) **fused MLA-style attention** in Stage B, which is a different kernel target (the K/V latent absorb fuses Q and attention into a single op — a different shape and a different bottleneck).
 
 ### Stage B — MLA conversion (~3–4 weeks)
 
