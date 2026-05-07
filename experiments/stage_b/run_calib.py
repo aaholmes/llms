@@ -60,8 +60,11 @@ def main() -> int:
     )
     ap.add_argument(
         "--accumulator-device",
-        default="cpu",
-        help="device for the fp64 covariance accumulators",
+        default=None,
+        help=(
+            "device for the fp64 covariance accumulators; defaults to the "
+            "model device (keeps the per-iter reduction on-GPU)"
+        ),
     )
     ap.add_argument("--progress-every", type=int, default=50)
     args = ap.parse_args()
@@ -74,10 +77,14 @@ def main() -> int:
     print(f"[calib] loading {args.model_id} on {args.device} ({args.dtype})")
     t0 = time.time()
     loaded = load_weights(args.model_id, dtype=dtype, device=args.device)
+    num_layers = loaded.config.num_hidden_layers
+    hidden_size = loaded.config.hidden_size
     model = Qwen3Model.from_loaded(loaded).to(dtype=dtype, device=args.device).eval()
+    del loaded
+    if args.device == "cuda":
+        torch.cuda.empty_cache()
     load_s = time.time() - t0
-    print(f"[calib] model ready in {load_s:.1f}s; "
-          f"{loaded.config.num_hidden_layers} layers, hidden={loaded.config.hidden_size}")
+    print(f"[calib] model ready in {load_s:.1f}s; {num_layers} layers, hidden={hidden_size}")
 
     print(f"[calib] tokenizing {args.n_samples} × {args.chunk_tokens} WikiText-103 chunks "
           f"(seed={args.seed})")
@@ -94,10 +101,11 @@ def main() -> int:
               f"(insufficient text in WikiText-103 split)")
     print(f"[calib] {len(chunks)} chunks ready in {tok_s:.1f}s")
 
-    print(f"[calib] running forward passes; covariances accumulate on {args.accumulator_device}")
+    accumulator_device = args.accumulator_device or args.device
+    print(f"[calib] running forward passes; covariances accumulate on {accumulator_device}")
     t0 = time.time()
     chunks_on_device = [c.to(args.device) for c in chunks]
-    with CovarianceCollector(model, accumulator_device=args.accumulator_device) as col:
+    with CovarianceCollector(model, accumulator_device=accumulator_device) as col:
         for i, ids in enumerate(chunks_on_device):
             cache = model.alloc_cache(ids.shape[1])
             with torch.inference_mode():
@@ -118,12 +126,14 @@ def main() -> int:
     print(f"[calib] {token_count} tokens accumulated in {fwd_s:.1f}s "
           f"({token_count / fwd_s:.0f} tok/s)")
 
+    covs = [c.cpu() for c in covs]
+
     artifact = {
         "covariances": covs,
         "meta": {
             "model_id": args.model_id,
-            "num_layers": loaded.config.num_hidden_layers,
-            "hidden_size": loaded.config.hidden_size,
+            "num_layers": num_layers,
+            "hidden_size": hidden_size,
             "n_samples": args.n_samples,
             "chunk_tokens": args.chunk_tokens,
             "actual_chunks": len(chunks),
@@ -134,7 +144,7 @@ def main() -> int:
             "tokenizer_id": args.model_id,
             "model_dtype": args.dtype,
             "accumulator_dtype": "float64",
-            "accumulator_device": args.accumulator_device,
+            "accumulator_device": str(accumulator_device),
             "torch_version": torch.__version__,
             "cuda_device": (
                 torch.cuda.get_device_name(0) if torch.cuda.is_available() else None

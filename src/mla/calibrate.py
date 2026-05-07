@@ -7,7 +7,9 @@ three since they share the input).
 
 Hooks attach to ``block.attn`` as forward pre-hooks; ``args[0]`` is the
 post-norm-1 tensor of shape (B, T, hidden). Accumulation is fp64 on a chosen
-device — typically CPU to leave VRAM for the model on a 16 GB GPU.
+device — by default the same device as the model, so the per-iter
+``x_flatᵀ @ x_flat`` reduction stays on-GPU and avoids ~5 MB-per-layer
+transfers on every prompt.
 
 Usage:
     with CovarianceCollector(model) as col:
@@ -33,20 +35,25 @@ class CovarianceCollector:
     ----------
     model : Qwen3Model
         The engine model whose attention inputs will be captured.
-    accumulator_device : str | torch.device
-        Where the fp64 accumulators live. Default ``"cpu"`` so VRAM stays
-        free for the model. Activations are copied off the model device
-        per-call.
+    accumulator_device : str | torch.device | None
+        Where the fp64 accumulators live. ``None`` (the default) resolves to
+        the model's device, which keeps the per-iter ``x_flatᵀ @ x_flat``
+        reduction on the same device as the activations and avoids a
+        round-trip per layer per prompt. Pass ``"cpu"`` explicitly to
+        offload accumulators from the model device — only needed when VRAM
+        is tight (~5 MB per layer × 36 layers ≈ 200 MB on Qwen3-4B).
     """
 
     def __init__(
         self,
         model: Qwen3Model,
         *,
-        accumulator_device: str | torch.device = "cpu",
+        accumulator_device: str | torch.device | None = None,
     ) -> None:
         self.num_layers = len(model.layers)
         self.hidden = model.cfg.hidden_size
+        if accumulator_device is None:
+            accumulator_device = next(model.parameters()).device
         self._device = torch.device(accumulator_device)
         self._accumulators: list[torch.Tensor] = [
             torch.zeros(self.hidden, self.hidden, dtype=torch.float64, device=self._device)
@@ -103,13 +110,14 @@ def collect_covariances(
     model: Qwen3Model,
     prompt_ids: list[torch.Tensor],
     *,
-    accumulator_device: str | torch.device = "cpu",
+    accumulator_device: str | torch.device | None = None,
     progress_every: int | None = None,
 ) -> list[torch.Tensor]:
     """Run prompts through ``model`` under hooks; return per-layer covariances.
 
     Each prompt is a (1, T) token tensor. A throwaway KV cache is allocated
-    per prompt and freed immediately. Output is fp64 on ``accumulator_device``.
+    per prompt and freed immediately. Output is fp64 on ``accumulator_device``
+    (defaulting to the model's device).
     """
     with CovarianceCollector(model, accumulator_device=accumulator_device) as col:
         for i, ids in enumerate(prompt_ids):

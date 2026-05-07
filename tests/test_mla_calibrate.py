@@ -110,3 +110,35 @@ def test_empty_raises(small_model):
     with CovarianceCollector(small_model) as col:
         with pytest.raises(RuntimeError):
             col.covariances()
+
+
+@pytest.mark.requires_draft
+def test_default_device_follows_model(small_model, small_prompts):
+    """Default ``accumulator_device=None`` resolves to the model's device.
+
+    Keeps the per-iter ``x_flatᵀ @ x_flat`` reduction co-located with the
+    activations rather than round-tripping over PCIe.
+    """
+    model_device = next(small_model.parameters()).device
+    with CovarianceCollector(small_model) as col:
+        for ids in small_prompts:
+            cache = small_model.alloc_cache(ids.shape[1])
+            with torch.inference_mode():
+                small_model(ids, cache, start_pos=0)
+        covs = col.covariances()
+    for c in covs:
+        assert c.device == model_device
+
+
+@pytest.mark.requires_draft
+def test_explicit_cpu_override_still_works(small_model, small_prompts):
+    """Explicit ``accumulator_device='cpu'`` keeps accumulators on CPU
+    even when the model would otherwise dictate the device."""
+    with CovarianceCollector(small_model, accumulator_device="cpu") as col:
+        for ids in small_prompts:
+            cache = small_model.alloc_cache(ids.shape[1])
+            with torch.inference_mode():
+                small_model(ids, cache, start_pos=0)
+        covs = col.covariances()
+    for c in covs:
+        assert c.device == torch.device("cpu")
