@@ -11,7 +11,7 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-gpu = ["triton>=3.0"]
+gpu = ["triton>=3.0", "datasets>=2.18"]
 
 [dependency-groups]
 dev = ["pytest>=8.0"]
