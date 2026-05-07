@@ -21,8 +21,50 @@ Hard-gated stages; see `DESIGN.md` for the plan, hardware, and the future-extens
   - ✅ **Per-layer covariance collector.** Forward-hook pipeline that streams a calibration corpus (1k × 256-token chunks of WikiText-103) through the engine and accumulates `C_ℓ = (1/N) Σ x_t x_tᵀ` per attention layer. **256k tokens accumulated through Qwen3-4B in 9.4 min on the 5060 Ti**; all 36 layers symmetric and positive semidefinite, conditioning ~10⁴–10⁵ — well inside the default ridge regime. 9 tests.
   - ✅ **MLAttention runtime + compressed KV cache.** Drop-in replacement for the engine's standard attention module that consumes already-computed MLA factors, applies partial-RoPE per head, and serves attention against a cache storing `(c_kv, k_rope_pre)` per token. Single-norm-on-concatenated-K mode preserves *algebraic* equivalence to baseline GQA attention given full-rank factors — verified to ≤1e-5 in fp32 and ≤1e-10 in fp64. 12 tests covering a `d_rope` sweep, prefill+decode, and exact-low-rank construction.
   - ✅ **Conversion CLI + post-hoc swap.** `python -m mla.convert <hf-id> --rank ... --d-rope ... --calib ...` reads the calibration artifact and runs one *joint* SVD per layer over the stacked `[W_K_nope; W_V]` rows — joint factoring is what makes the down-projection `W_dkv` shared across K-nope and V (the whole point of MLA's compressed cache). Output is a self-contained `.pt` artifact swapped into a fresh `Qwen3Model` via `apply_mla(...)`. 14 synthetic tests + 2 real-Qwen3-0.6B end-to-end smokes. **Qwen3-4B converts in 55 s on CPU** at `rank=128, d_rope=32`, giving a structural KV-cache compression of **5.33×** before perplexity is even measured (target was ≥4×).
-  - ⏳ **Perplexity sweep.** The headline gate: ≥4× KV-cache compression at ≤2% perplexity Δ on Qwen3-4B over a held-out WikiText-103 slice, swept over `(rank, d_rope)`. Compression ratio is already in hand; this sub-stage is what decides whether the conversion is *good enough*.
+  - ✅ **Perplexity sweep on Qwen3-4B.** Streaming PPL over a held-out 250-chunk × 1024-token slice of WikiText-103 validation (disjoint from the train-split calibration). Two grids run: the headline `partial-rope` design and a `v-only` fallback (`d_rope = head_dim`, no nope subspace, K stays full-RoPE). **The 2% PPL Δ at ≥4× compression hard gate was *not* met at this calibration with no finetuning** — see results below.
 - **Stage C — joint sweep at fixed VRAM** — pending. How target-compression × draft-compression × spec-decode-K trade off at a fixed 16 GB VRAM budget. Three named regimes — both uncompressed, target only, both compressed at matched ratios — directly test whether coupling SVD distortion across target and draft preserves spec-decode acceptance relative to compressing the target alone.
+
+## Stage B perplexity results
+
+The conversion pipeline is correct end-to-end (the algebraic round-trip and exact-low-rank tests are tight to fp64). The empirical finding is about *the model*, not the math: post-hoc partial-RoPE on a checkpoint trained with full-RoPE catastrophically degrades quality without a healing finetune.
+
+**Setup.** Eval slice is 250 chunks × 1024 tokens from the WikiText-103 *validation* split (disjoint from the 1k × 256-token train-split calibration). PPL is computed in BF16 on cuda using fixed-length chunks with cache reset per chunk; the absolute number is therefore higher than published sliding-window PPLs (≈21.6 here vs ~9 in the literature for similar Qwen3-class models) but the *ratio* between baseline and MLA is what matters and is consistent across both runs.
+
+**Variant A — partial-RoPE** (the headline MLA design: K and V both compressed via shared latent, small RoPE-only K subspace kept full-rank).
+
+| Config | rank | d_rope | KV B/tok | Compression | PPL | Δ % vs baseline |
+|---|---:|---:|---:|---:|---:|---:|
+| baseline | — | — | 4096 | 1.00× | 21.64 | — |
+| r256_drope32 | 256 | 32 | 1024 | 4.00× | 1986.71 | **+9079.6%** |
+| r192_drope32 | 192 | 32 | 896 | 4.57× | 3586.73 | **+16472.6%** |
+| r128_drope32 | 128 | 32 | 768 | 5.33× | 2970.20 | **+13623.9%** |
+| r128_drope64 | 128 | 64 | 1280 | 3.20× | 1191.47 | **+5405.2%** |
+| r96_drope32 | 96 | 32 | 704 | 5.82× | 3699.57 | **+16994.0%** |
+| r64_drope32 | 64 | 32 | 640 | 6.40× | 5572.51 | **+25648.0%** |
+
+**Variant B — V-only** (`d_rope = head_dim`, so no nope subspace; K stays full-rank with full RoPE preserved, only V gets factored through the latent).
+
+| Config | rank | d_rope | KV B/tok | Compression | PPL | Δ % vs baseline |
+|---|---:|---:|---:|---:|---:|---:|
+| baseline | — | — | 4096 | 1.00× | 21.64 | — |
+| r1024_drope128 | 1024 | 128 | 4096 | 1.00× | 21.64 | −0.01% (noise) |
+| r768_drope128 | 768 | 128 | 3584 | 1.14× | 25.68 | +18.7% |
+| r512_drope128 | 512 | 128 | 3072 | 1.33× | 27.12 | +25.3% |
+| r384_drope128 | 384 | 128 | 2816 | 1.45× | 29.87 | +38.0% |
+| r256_drope128 | 256 | 128 | 2560 | 1.60× | 35.45 | +63.8% |
+| r128_drope128 | 128 | 128 | 2304 | 1.78× | 89.86 | +315.2% |
+
+**Diagnosis.** Three observations make the picture tight:
+
+1. *The conversion's per-layer reconstruction error is small.* The discarded singular energy (analytic C-weighted residual) at rank=128, d_rope=32 averages 1.3e3 across layers — a few orders of magnitude below the activation magnitudes the layers see. The SVD is doing its job.
+2. *V-only at maximum rank reproduces baseline to numerical noise* (Δ = −0.01% at rank=1024, d_rope=128). The runtime, factor assembly, and post-hoc swap pipeline are end-to-end correct.
+3. *V-only degrades gracefully; partial-RoPE doesn't.* At V-only `rank=128` (1.78× compression) the PPL Δ is +315%; at partial-RoPE `rank=128, d_rope=32` (5.33× compression) it's +13624%. The gap between these — 40× more PPL damage at higher compression — is overwhelmingly attributable to the partial-RoPE structural change, not to the lower rank.
+
+The mechanism: Qwen3-4B was trained to apply RoPE rotation to the *full* `head_dim` of K. Partial-RoPE attention applies the rotation only to a `d_rope`-wide subspace — algebraically a different operation. Even when the shared latent reconstructs `K_nope` faithfully, the model's downstream layers have never seen the resulting attention pattern. Every published post-hoc MHA→MLA paper resolves this by running a healing finetune (LoRA on the K/V factors over a few thousand steps), which is exactly the contingency the project plan flags as `B.stretch-2 (LoRA healing-FT)`.
+
+**What this means for Stage C.** The 4–8× KV-cache compression promised by MLA is conditional on healing FT. Without it, the achievable compression at acceptable PPL is ≤1.45× via V-only (≈1.45× compression at +38% PPL, or ≈1.33× at +25%). The Stage C joint sweep can either (a) operate on these V-only points as the "no-FT working zone", or (b) wait on the +1-week LoRA healing-FT stretch milestone to unlock the full headline regime. That's the open decision at the Stage B → Stage C handoff.
+
+Raw artifacts: `experiments/stage_b/eval_summary_partial_rope.md` and `eval_summary_v_only.md` (committed); per-config converted checkpoints under `experiments/stage_b/r*.pt` (gitignored).
 
 ## Engine speedups (Stage A end-to-end)
 
