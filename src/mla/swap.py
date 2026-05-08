@@ -27,6 +27,13 @@ def apply_mla(model: Qwen3Model, artifact: dict) -> Qwen3Model:
     """
     meta = artifact["meta"]
     state = artifact["state"]
+    convention = meta.get("rope_convention")
+    if convention != "original-pairs":
+        raise ValueError(
+            f"artifact rope_convention={convention!r} is not supported; only "
+            f"'original-pairs' is accepted. Re-convert the model with the "
+            f"current `python -m mla.convert ...` to upgrade."
+        )
     for i, block in enumerate(model.layers):
         if isinstance(block.attn, MLAttention):
             continue

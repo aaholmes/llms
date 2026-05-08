@@ -6,12 +6,22 @@ K head, then split for partial-RoPE) is *algebraically equivalent* to a
 plain partial-RoPE attention given full-rank factors. The reference here
 is **not** vanilla Qwen3 ``Attention`` because Qwen3 RoPE-rotates the
 full head_dim while MLA only rotates the d_rope subspace; the proper
-baseline is "Qwen3 attention with RoPE restricted to the last d_rope
-dims of each head". We inline that reference (``PartialRoPEAttention``)
-in this file so the comparison is unambiguous.
+baseline is "Qwen3 attention with RoPE restricted to the d_rope subspace
+that comprises the *first ``d_rope/2`` original Qwen3 RoPE pairs*". We
+inline that reference (``PartialRoPEAttention``) in this file so the
+comparison is unambiguous.
+
+The "rope subspace" is the set of head dimensions
+``[0, 1, …, d_rope/2 − 1, head_dim/2, …, head_dim/2 + d_rope/2 − 1]`` —
+i.e. both halves of the first ``d_rope/2`` original RoPE pairs. Realised
+in the runtime via a ``head_dim`` permutation that puts those dims at the
+end so the runtime keeps a contiguous-last-``d_rope`` layout.
 
 Tests:
-  - prefill bit-equivalence at full rank, varied d_rope
+  - third-party math check: partial-RoPE on the rope subspace equals a
+    slice of original full-RoPE applied with the original frequencies
+  - prefill bit-equivalence between MLAttention and PartialRoPEAttention
+    at full rank, varied d_rope
   - decode-step bit-equivalence following a prefill
   - exact-low-rank construction (W_K/W_V built from rank-r₀ factors)
   - MLAKVCache shape + truncate semantics
@@ -43,6 +53,97 @@ class _Cfg:
 CFG = _Cfg()
 
 
+# --- rope-subspace permutation helpers ------------------------------------
+
+def rope_pair_permutation(head_dim: int, d_rope: int) -> list[int]:
+    """Per-head permutation that puts the first d_rope/2 original RoPE pairs
+    at the *end* of the head, contiguously.
+
+    Returns a length-``head_dim`` list ``perm`` such that
+    ``permuted_head[i] = original_head[perm[i]]``. The first ``d_nope`` slots
+    hold the no-rope dims; the last ``d_rope`` slots hold the rope subspace
+    laid out as [pair_0_half_1, …, pair_{d_rope/2-1}_half_1,
+    pair_0_half_2, …, pair_{d_rope/2-1}_half_2] so that the runtime's
+    ``_rotate_half`` over those last d_rope dims pairs the right halves.
+    """
+    half = head_dim // 2
+    h_rope = d_rope // 2
+    rope_dims = list(range(h_rope)) + list(range(half, half + h_rope))
+    nope_dims = list(range(h_rope, half)) + list(range(half + h_rope, head_dim))
+    return nope_dims + rope_dims
+
+
+def inverse_permutation(perm: list[int]) -> list[int]:
+    inv = [0] * len(perm)
+    for i, p in enumerate(perm):
+        inv[p] = i
+    return inv
+
+
+# --- third-party math check -----------------------------------------------
+
+def test_partial_rope_matches_original_qwen3_on_rope_subspace() -> None:
+    """Partial-RoPE on the permuted-rope subspace = slice of original full-RoPE.
+
+    Independent check that the math we're going to implement in MLAttention
+    and PartialRoPEAttention is faithful to Qwen3's original full-RoPE on
+    the dimensions that survive the partial-RoPE selection.
+    """
+    head_dim = 128
+    base = 1_000_000.0  # Qwen3-4B's rope_theta
+    max_pos = 64
+    T = 5
+
+    for d_rope in (32, 64):
+        d_nope = head_dim - d_rope
+        perm = rope_pair_permutation(head_dim, d_rope)
+        inv_perm = inverse_permutation(perm)
+
+        rope_dims_in_orig = perm[d_nope:]  # last d_rope of perm = rope subspace
+        nope_dims_in_orig = perm[:d_nope]
+
+        torch.manual_seed(d_rope)
+        x = torch.randn(1, 1, T, head_dim)
+
+        # Original full-RoPE
+        cos_full, sin_full = build_rope_tables(head_dim, max_pos, base=base)
+        positions = torch.arange(T)
+        cos_p = cos_full[positions].unsqueeze(0).unsqueeze(0)
+        sin_p = sin_full[positions].unsqueeze(0).unsqueeze(0)
+        full_rotated = x * cos_p + _rotate_half(x) * sin_p
+
+        # Partial-RoPE on the permuted x using the sliced original inv_freq
+        x_perm = x[..., perm]
+        full_inv_freq = 1.0 / (
+            base ** (torch.arange(0, head_dim, 2, dtype=torch.float32) / head_dim)
+        )
+        inv_freq = full_inv_freq[: d_rope // 2]
+        t = torch.arange(max_pos, dtype=torch.float32)
+        freqs = torch.outer(t, inv_freq)
+        emb = torch.cat([freqs, freqs], dim=-1)
+        cos_partial = emb.cos()[positions].unsqueeze(0).unsqueeze(0)
+        sin_partial = emb.sin()[positions].unsqueeze(0).unsqueeze(0)
+
+        x_nope, x_rope = x_perm.split([d_nope, d_rope], dim=-1)
+        x_rope_rot = x_rope * cos_partial + _rotate_half(x_rope) * sin_partial
+        partial_perm = torch.cat([x_nope, x_rope_rot], dim=-1)
+        partial_unperm = partial_perm[..., inv_perm]
+
+        # Rope subspace dims must match original full-RoPE on those same dims.
+        for d in rope_dims_in_orig:
+            diff = (partial_unperm[..., d] - full_rotated[..., d]).abs().max().item()
+            assert diff < 1e-5, (
+                f"d_rope={d_rope}, dim {d}: partial-RoPE diverges from original "
+                f"full-RoPE on the rope subspace ({diff:.2e})"
+            )
+        # Nope-subspace dims must be unchanged from input (no rotation applied).
+        for d in nope_dims_in_orig:
+            diff = (partial_unperm[..., d] - x[..., d]).abs().max().item()
+            assert diff < 1e-7, (
+                f"d_rope={d_rope}, dim {d}: nope subspace was modified ({diff:.2e})"
+            )
+
+
 # --- partial-RoPE reference attention -------------------------------------
 
 class PartialRoPEAttention(nn.Module):
@@ -66,9 +167,23 @@ class PartialRoPEAttention(nn.Module):
         self.o = nn.Linear(cfg.num_heads * cfg.head_dim, cfg.hidden_size, bias=False)
         self.q_norm = RMSNorm(cfg.head_dim, eps=cfg.rms_eps)
         self.k_norm = RMSNorm(cfg.head_dim, eps=cfg.rms_eps)
-        cos, sin = build_rope_tables(d_rope, cfg.max_pos, base=cfg.rope_theta)
-        self.register_buffer("rope_cos", cos, persistent=False)
-        self.register_buffer("rope_sin", sin, persistent=False)
+        # Match MLAttention's rope-table construction: sliced original-pair
+        # frequencies, not a fresh d_rope-sized formula.
+        if d_rope > 0:
+            full_inv_freq = 1.0 / (
+                cfg.rope_theta ** (
+                    torch.arange(0, cfg.head_dim, 2, dtype=torch.float32) / cfg.head_dim
+                )
+            )
+            inv_freq = full_inv_freq[: d_rope // 2]
+            t = torch.arange(cfg.max_pos, dtype=torch.float32)
+            freqs = torch.outer(t, inv_freq)
+            emb = torch.cat([freqs, freqs], dim=-1)
+            self.register_buffer("rope_cos", emb.cos(), persistent=False)
+            self.register_buffer("rope_sin", emb.sin(), persistent=False)
+        else:
+            self.rope_cos = None
+            self.rope_sin = None
 
     def _apply_rope_slice(
         self, x: torch.Tensor, positions: torch.Tensor

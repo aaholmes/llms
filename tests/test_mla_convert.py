@@ -17,7 +17,7 @@ from transformers import PretrainedConfig
 
 from engine.model import Qwen3Model
 from engine.weights import LoadedModel
-from mla.convert import convert_loaded_to_mla
+from mla.convert import convert_loaded_to_mla, per_head_rope_pair_perm
 from mla.swap import alloc_mla_cache, apply_mla
 
 
@@ -145,16 +145,26 @@ def test_factor_level_full_rank_lossless(d_rope: int) -> None:
         calibration_meta=_calib_meta(c),
     )
 
+    perm = per_head_rope_pair_perm(c.head_dim, d_rope)
+    # Permuted rows of W_K (in original-coord terms): nope = first d_nope
+    # of the permuted head, rope = last d_rope.
     nope_rows = [
-        h * c.head_dim + i
+        h * c.head_dim + perm[i]
         for h in range(c.num_key_value_heads)
         for i in range(d_nope)
     ]
     rope_rows = [
-        h * c.head_dim + d_nope + j
+        h * c.head_dim + perm[d_nope + j]
         for h in range(c.num_key_value_heads)
         for j in range(d_rope)
     ]
+    q_row_perm = [
+        h * c.head_dim + perm[i]
+        for h in range(c.num_attention_heads)
+        for i in range(c.head_dim)
+    ]
+
+    assert artifact["meta"]["rope_convention"] == "original-pairs"
 
     for i in range(c.num_hidden_layers):
         W_K = loaded.state[f"layers.{i}.attn.k.weight"]
@@ -163,7 +173,7 @@ def test_factor_level_full_rank_lossless(d_rope: int) -> None:
         W_dkv = artifact["state"][prefix + "dkv.weight"]
         W_uv = artifact["state"][prefix + "uv.weight"]
 
-        # V round-trip: W_uv @ W_dkv ≈ W_V.
+        # V round-trip: W_uv @ W_dkv ≈ W_V (V is *not* permuted).
         V_recon = W_uv @ W_dkv
         v_err = (V_recon - W_V).abs().max().item()
         assert v_err < 1e-9, f"layer {i}, d_rope={d_rope}: V residual {v_err:.2e}"
@@ -179,16 +189,25 @@ def test_factor_level_full_rank_lossless(d_rope: int) -> None:
         if d_rope > 0:
             W_kr = artifact["state"][prefix + "kr.weight"]
             assert torch.equal(W_kr, W_K[rope_rows].contiguous()), (
-                f"layer {i}: kr should be a bit-exact copy of the rope rows"
+                f"layer {i}: kr should be a bit-exact copy of the permuted rope rows"
             )
         else:
             assert prefix + "kr.weight" not in artifact["state"]
 
-        # Q, O, norms copied through bit-exact (after the dtype cast we requested).
-        for name in ("q.weight", "o.weight", "q_norm.weight", "k_norm.weight"):
-            orig = loaded.state[prefix + name]
-            converted = artifact["state"][prefix + name]
-            assert torch.equal(orig, converted), f"layer {i}: {name} not copied"
+        # O is NOT permuted; q, q_norm, k_norm ARE permuted.
+        assert torch.equal(
+            artifact["state"][prefix + "o.weight"],
+            loaded.state[prefix + "o.weight"],
+        ), f"layer {i}: o.weight should be untouched"
+        assert torch.equal(
+            artifact["state"][prefix + "q.weight"],
+            loaded.state[prefix + "q.weight"][q_row_perm],
+        ), f"layer {i}: q.weight should be row-permuted"
+        for name in ("q_norm.weight", "k_norm.weight"):
+            assert torch.equal(
+                artifact["state"][prefix + name],
+                loaded.state[prefix + name][perm],
+            ), f"layer {i}: {name} should be permuted"
 
 
 @pytest.mark.parametrize("d_rope", [0, 8])
@@ -200,13 +219,14 @@ def test_factor_level_exact_low_rank_recovery(d_rope: int) -> None:
 
     loaded = _tiny_loaded(c, seed=7, dtype=torch.float64)
 
+    perm = per_head_rope_pair_perm(c.head_dim, d_rope)
     nope_rows = [
-        h * c.head_dim + i
+        h * c.head_dim + perm[i]
         for h in range(c.num_key_value_heads)
         for i in range(d_nope)
     ]
     rope_rows = [
-        h * c.head_dim + d_nope + j
+        h * c.head_dim + perm[d_nope + j]
         for h in range(c.num_key_value_heads)
         for j in range(d_rope)
     ]
@@ -224,17 +244,15 @@ def test_factor_level_exact_low_rank_recovery(d_rope: int) -> None:
             if d_rope > 0 else torch.zeros(0, c.hidden_size, dtype=torch.float64)
         )
 
+        # Nope rows at perm[:d_nope] (non-contiguous original-pair-respecting
+        # positions); rope rows at perm[d_nope:].
         K_nope_full = W_uk_nope @ W_dkv
         W_K = torch.empty(c.num_key_value_heads * c.head_dim, c.hidden_size, dtype=torch.float64)
         for h in range(c.num_key_value_heads):
-            if d_nope > 0:
-                W_K[h * c.head_dim : h * c.head_dim + d_nope] = (
-                    K_nope_full[h * d_nope : (h + 1) * d_nope]
-                )
-            if d_rope > 0:
-                W_K[h * c.head_dim + d_nope : (h + 1) * c.head_dim] = (
-                    W_kr[h * d_rope : (h + 1) * d_rope]
-                )
+            for ii in range(d_nope):
+                W_K[h * c.head_dim + perm[ii]] = K_nope_full[h * d_nope + ii]
+            for jj in range(d_rope):
+                W_K[h * c.head_dim + perm[d_nope + jj]] = W_kr[h * d_rope + jj]
         W_V = W_uv @ W_dkv
 
         loaded.state[f"layers.{i}.attn.k.weight"] = W_K

@@ -149,11 +149,23 @@ class MLAttention(nn.Module):
         self.k_norm = RMSNorm(head_dim, eps=rms_eps)
 
         if d_rope > 0:
-            cos, sin = build_rope_tables(
-                d_rope, max_position_embeddings, base=rope_theta, dtype=torch.float32
+            # The rope subspace is the first d_rope/2 *original* RoPE pairs of
+            # the head, brought to the end of head_dim by the conversion's
+            # weight permutation. So the cos/sin table here uses a slice of
+            # the original head_dim-sized inv_freq, not a fresh d_rope-sized
+            # one. This is what makes the partial-RoPE rotation faithful to
+            # what the trained model expects on those dims.
+            full_inv_freq = 1.0 / (
+                rope_theta ** (
+                    torch.arange(0, head_dim, 2, dtype=torch.float32) / head_dim
+                )
             )
-            self.register_buffer("rope_cos", cos, persistent=False)
-            self.register_buffer("rope_sin", sin, persistent=False)
+            inv_freq = full_inv_freq[: d_rope // 2]
+            t = torch.arange(max_position_embeddings, dtype=torch.float32)
+            freqs = torch.outer(t, inv_freq)
+            emb = torch.cat([freqs, freqs], dim=-1)
+            self.register_buffer("rope_cos", emb.cos(), persistent=False)
+            self.register_buffer("rope_sin", emb.sin(), persistent=False)
         else:
             self.rope_cos = None
             self.rope_sin = None

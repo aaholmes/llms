@@ -34,20 +34,32 @@ from engine.weights import LoadedModel, load_weights
 from mla.svd import activation_aware_factor, discarded_singular_energy
 
 
-def _row_indices(num_kv_heads: int, head_dim: int, d_rope: int) -> tuple[list[int], list[int]]:
-    """Return (nope_rows, rope_rows) into a (num_kv_heads * head_dim,) row axis."""
-    d_nope = head_dim - d_rope
-    nope_rows = [
-        h * head_dim + i
-        for h in range(num_kv_heads)
-        for i in range(d_nope)
-    ]
-    rope_rows = [
-        h * head_dim + d_nope + j
-        for h in range(num_kv_heads)
-        for j in range(d_rope)
-    ]
-    return nope_rows, rope_rows
+def per_head_rope_pair_perm(head_dim: int, d_rope: int) -> list[int]:
+    """Per-head permutation that brings the rope subspace to the end of head_dim.
+
+    The rope subspace is the first ``d_rope/2`` *original* Qwen3 RoPE pairs
+    ``(i, i + head_dim/2)`` for ``i ∈ [0, d_rope/2)``. After this permutation:
+
+      * positions ``[0, d_nope)`` hold the no-rope dims
+        ``[d_rope/2, head_dim/2) ∪ [head_dim/2 + d_rope/2, head_dim)``
+      * positions ``[d_nope, head_dim)`` hold the rope dims, laid out as
+        ``[0, d_rope/2) ++ [head_dim/2, head_dim/2 + d_rope/2)`` — so that
+        ``_rotate_half`` over the trailing ``d_rope`` pairs original-dim
+        ``i`` with ``i + head_dim/2``, exactly matching Qwen3 training.
+
+    Returns a length-``head_dim`` list ``perm`` such that
+    ``permuted_head[i] = original_head[perm[i]]``.
+    """
+    half = head_dim // 2
+    h_rope = d_rope // 2
+    rope_dims = list(range(h_rope)) + list(range(half, half + h_rope))
+    nope_dims = list(range(h_rope, half)) + list(range(half + h_rope, head_dim))
+    return nope_dims + rope_dims
+
+
+def _expand_row_perm(perm: list[int], num_heads: int, head_dim: int) -> list[int]:
+    """Expand a per-head perm to a row permutation for a (num_heads*head_dim, *) matrix."""
+    return [h * head_dim + perm[i] for h in range(num_heads) for i in range(head_dim)]
 
 
 def _git_rev() -> str:
@@ -124,12 +136,31 @@ def convert_loaded_to_mla(
             )
 
     d_nope = head_dim - d_rope
-    nope_rows, rope_rows = _row_indices(num_kv_heads, head_dim, d_rope)
 
     rope_theta = float(
         getattr(cfg, "rope_parameters", None) and cfg.rope_parameters.get("rope_theta")
         or getattr(cfg, "rope_theta", 10000.0)
     )
+
+    # Permutation that re-orders each head so the rope subspace (first
+    # d_rope/2 original RoPE pairs) lives at the *end*. We apply it to W_q,
+    # W_K, q_norm.weight, k_norm.weight at conversion time so the runtime
+    # MLAttention sees a contiguous "rope = last d_rope dims" layout. V and
+    # o_proj keep their original ordering — V isn't RoPE'd, and the
+    # attention output (softmax(Q·Kᵀ)·V) is in V's ordering, so o_proj
+    # consumes it unchanged.
+    head_perm = per_head_rope_pair_perm(head_dim, d_rope)
+    k_row_perm = _expand_row_perm(head_perm, num_kv_heads, head_dim)
+    q_row_perm = _expand_row_perm(head_perm, num_heads, head_dim)
+    # After permutation, the first d_nope rows per head are nope, last
+    # d_rope rows per head are rope — so the existing contiguous slicing
+    # is correct *on the permuted matrix*.
+    nope_rows_in_perm = [
+        h * head_dim + i for h in range(num_kv_heads) for i in range(d_nope)
+    ]
+    rope_rows_in_perm = [
+        h * head_dim + d_nope + j for h in range(num_kv_heads) for j in range(d_rope)
+    ]
 
     out_state: dict[str, torch.Tensor] = {}
     diagnostics: list[dict] = []
@@ -137,8 +168,8 @@ def convert_loaded_to_mla(
     t0_total = time.time()
     for i in range(num_layers):
         prefix = f"layers.{i}.attn."
-        W_K = loaded.state[prefix + "k.weight"]
-        W_V = loaded.state[prefix + "v.weight"]
+        W_K_perm = loaded.state[prefix + "k.weight"][k_row_perm, :]
+        W_V = loaded.state[prefix + "v.weight"]  # *not* permuted
         C = covariances[i]
         if C.shape != (hidden_size, hidden_size):
             raise ValueError(
@@ -146,14 +177,14 @@ def convert_loaded_to_mla(
             )
 
         if d_nope > 0 and d_rope > 0:
-            W_K_nope = W_K[nope_rows]
-            W_kr = W_K[rope_rows]
+            W_K_nope = W_K_perm[nope_rows_in_perm]
+            W_kr = W_K_perm[rope_rows_in_perm]
         elif d_nope > 0:  # d_rope == 0
-            W_K_nope = W_K
+            W_K_nope = W_K_perm
             W_kr = None
         else:  # d_nope == 0, d_rope == head_dim
             W_K_nope = None
-            W_kr = W_K
+            W_kr = W_K_perm
 
         # Joint SVD over the stacked nope-K + V rows so they share W_dkv.
         if W_K_nope is not None:
@@ -180,11 +211,15 @@ def convert_loaded_to_mla(
             A_K_nope = None
             A_V = A
 
-        # Cast factors and copy-throughs to factor_dtype.
-        out_state[prefix + "q.weight"] = loaded.state[prefix + "q.weight"].to(factor_dtype).clone()
+        # Q, q_norm, k_norm get the head permutation; o.weight stays as-is.
+        W_q_perm = loaded.state[prefix + "q.weight"][q_row_perm, :]
+        q_norm_perm = loaded.state[prefix + "q_norm.weight"][head_perm]
+        k_norm_perm = loaded.state[prefix + "k_norm.weight"][head_perm]
+
+        out_state[prefix + "q.weight"] = W_q_perm.to(factor_dtype).contiguous()
         out_state[prefix + "o.weight"] = loaded.state[prefix + "o.weight"].to(factor_dtype).clone()
-        out_state[prefix + "q_norm.weight"] = loaded.state[prefix + "q_norm.weight"].to(factor_dtype).clone()
-        out_state[prefix + "k_norm.weight"] = loaded.state[prefix + "k_norm.weight"].to(factor_dtype).clone()
+        out_state[prefix + "q_norm.weight"] = q_norm_perm.to(factor_dtype).contiguous()
+        out_state[prefix + "k_norm.weight"] = k_norm_perm.to(factor_dtype).contiguous()
         out_state[prefix + "dkv.weight"] = B.to(factor_dtype).contiguous()
         out_state[prefix + "uv.weight"] = A_V.to(factor_dtype).contiguous()
         if A_K_nope is not None:
@@ -217,6 +252,7 @@ def convert_loaded_to_mla(
         "rope_theta": rope_theta,
         "rms_eps": float(cfg.rms_norm_eps),
         "qk_norm_mode": "single",
+        "rope_convention": "original-pairs",
         "factor_dtype": str(factor_dtype).replace("torch.", ""),
         "ridge_lambda": ridge_lambda,
         "torch_version": torch.__version__,
