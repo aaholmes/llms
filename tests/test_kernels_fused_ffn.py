@@ -8,10 +8,6 @@ without the down projection:
 
 where ``x`` has shape ``(..., K)`` and ``Wg, Wu`` have shape ``(N, K)`` —
 matching ``torch.nn.Linear.weight`` layout (out, in).
-
-The TDD ladder for Stage A.5a is documented in
-``~/.claude/plans/ok-make-a-detailed-keen-clover.md``. This file grows step
-by step; each step adds tests then unblocks the implementation.
 """
 
 from __future__ import annotations

@@ -233,4 +233,4 @@ The following directions are deferred — each would extend the project past the
 
 ## License
 
-TBD before public release.
+Apache License 2.0 — see [`LICENSE`](./LICENSE) for the full text.

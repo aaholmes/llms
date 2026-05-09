@@ -1,0 +1,26 @@
+cff-version: 1.2.0
+message: "If you reference this work, please cite as below."
+title: "Post-hoc MHA→MLA Conversion on a Single GPU"
+abstract: >-
+  A from-scratch single-GPU inference engine for Qwen3 used as the validation
+  harness for converting an existing MHA/GQA model (Qwen3-4B) to Multi-head
+  Latent Attention (MLA) without retraining, via activation-aware SVD with a
+  partial-RoPE split. Studies the joint Pareto of KV compression × speculative
+  decoding acceptance × perplexity at a fixed 16 GB VRAM budget.
+authors:
+  - family-names: Holmes
+    given-names: Adam A.
+type: software
+version: "0.1.0"
+date-released: "2026-05-09"
+license: Apache-2.0
+keywords:
+  - language-models
+  - inference
+  - mla
+  - multi-head-latent-attention
+  - speculative-decoding
+  - kv-cache-compression
+  - svd
+  - qwen3
+  - triton

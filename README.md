@@ -1,5 +1,7 @@
 # Post-hoc MHA→MLA Conversion on a Single GPU
 
+> **Status — v0.1.** Stage A (engine) and Stage A.5 (Triton kernels) are complete and tested. Stage B (post-hoc MHA→MLA conversion of Qwen3-4B) has the full pipeline shipped end-to-end, but **the headline 2 % PPL Δ at ≥4× compression gate is not yet met without a healing finetune** — see [Stage B perplexity results](#stage-b-perplexity-results). Stage C (joint compression × spec-decode sweep at fixed VRAM): pending.
+
 ## What this is, why it matters
 
 Generating text from a large language model token-by-token is bottlenecked by **KV-cache memory bandwidth**: at every new token, the GPU has to re-read a full set of cached "keys" and "values" — one pair per attention head, per past position — from main memory before it can compute the next token. On a 16 GB consumer GPU, that cache is the single biggest constraint on context length, and its memory traffic is what keeps decode rate well below peak compute.
@@ -81,4 +83,4 @@ Target: RTX 5060 Ti 16 GB (Blackwell). Engine and conversion development on a Ma
 
 ## License
 
-TBD before public release.
+Apache License 2.0 — see [`LICENSE`](./LICENSE) for the full text.

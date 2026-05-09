@@ -12,9 +12,6 @@ runtime forward sees one launch instead of three.
 
 QK-norm and RoPE stay downstream — *not* fused into the kernel — to keep
 the math contract a clean pure function and the TDD ladder simple.
-
-TDD ladder + design notes live in
-``~/.claude/plans/ok-make-a-detailed-keen-clover.md``.
 """
 
 from __future__ import annotations

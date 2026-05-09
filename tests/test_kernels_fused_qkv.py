@@ -10,9 +10,6 @@ expression that lives at the top of ``Attention.forward``
 
 where ``x`` has shape ``(..., K)`` and the three weights have shape
 ``(n_q, K)``, ``(n_k, K)``, ``(n_k, K)`` (n_v == n_k for GQA).
-
-The TDD ladder for Stage A.5b is documented in
-``~/.claude/plans/ok-make-a-detailed-keen-clover.md``.
 """
 
 from __future__ import annotations

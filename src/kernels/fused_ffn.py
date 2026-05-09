@@ -5,9 +5,6 @@ separate ``nn.Linear`` calls inside ``FFN.forward`` (``src/engine/model.py``).
 
 The third FFN matmul (``down``) stays as a regular ``nn.Linear``: fusing it
 would force ugly block-shape constraints across two different N axes.
-
-TDD ladder + design notes live in
-``~/.claude/plans/ok-make-a-detailed-keen-clover.md``.
 """
 
 from __future__ import annotations

@@ -149,8 +149,7 @@ If any pre-flight check fails, the project pivots to a non-Green-Context partiti
 
 ```
 llms/
-├── DESIGN.md                  # this file (public)
-├── MOTIVATION.md              # private
+├── DESIGN.md                  # this file
 ├── README.md                  # short summary, links to DESIGN
 ├── pyproject.toml
 ├── src/
@@ -228,4 +227,4 @@ These need answers during implementation; flagged here to prevent surprise mid-s
 
 ## License
 
-TBD before public release.
+Apache License 2.0 — see [`LICENSE`](./LICENSE) for the full text.
