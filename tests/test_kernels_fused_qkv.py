@@ -250,10 +250,12 @@ def test_qkv_split_views_into_heads():
     assert v.shape == (B, T, num_kv_heads, head_dim)
 
 
+@pytest.mark.requires_triton
 def test_qkv_shape_mismatch_raises():
     """Wrapper rejects inputs with mismatched dims, with clear errors.
 
-    CPU-only — no CUDA needed for arg validation.
+    Validates argument-checking only — no CUDA needed, but ``kernels.fused_qkv``
+    imports ``triton`` at module load so the test is gated on triton availability.
     """
     from kernels.fused_qkv import triton_fused_qkv
 

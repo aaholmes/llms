@@ -17,18 +17,15 @@ converted Qwen3-0.6B and asserts val PPL strictly drops.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
 from pathlib import Path
 
 import pytest
 import torch
 import torch.nn.functional as F
 from torch import nn
-from transformers import PretrainedConfig
 
 from engine.mla import MLAttention
 from engine.model import Qwen3Model
-from engine.weights import LoadedModel
 from mla.calibrate import collect_covariances
 from mla.convert import convert_loaded_to_mla
 from mla.heal import (
@@ -45,90 +42,19 @@ from mla.heal import (
 )
 from mla.swap import alloc_mla_cache, apply_mla
 
-
-# --- Tiny synthetic Qwen3 fixture (duplicated from test_mla_convert.py) ---
-
-
-@dataclass(frozen=True)
-class _Cfg:
-    vocab_size: int = 32
-    hidden_size: int = 64
-    num_hidden_layers: int = 2
-    num_attention_heads: int = 4
-    num_key_value_heads: int = 2
-    head_dim: int = 16
-    intermediate_size: int = 128
-    max_position_embeddings: int = 64
-    rms_norm_eps: float = 1e-6
-    rope_theta: float = 10000.0
+from ._tiny import Cfg, calib_meta, identity_covariances, tiny_loaded
 
 
-def _tiny_config(c: _Cfg) -> PretrainedConfig:
-    return PretrainedConfig(
-        vocab_size=c.vocab_size,
-        hidden_size=c.hidden_size,
-        num_hidden_layers=c.num_hidden_layers,
-        num_attention_heads=c.num_attention_heads,
-        num_key_value_heads=c.num_key_value_heads,
-        head_dim=c.head_dim,
-        intermediate_size=c.intermediate_size,
-        max_position_embeddings=c.max_position_embeddings,
-        rms_norm_eps=c.rms_norm_eps,
-        tie_word_embeddings=True,
-        rope_theta=c.rope_theta,
-        attention_bias=False,
-    )
-
-
-def _tiny_loaded(c: _Cfg, *, seed: int = 0, dtype: torch.dtype = torch.float32) -> LoadedModel:
-    torch.manual_seed(seed)
-    cfg = _tiny_config(c)
-    state: dict[str, torch.Tensor] = {
-        "embed.weight": torch.randn(c.vocab_size, c.hidden_size, dtype=dtype),
-        "final_norm.weight": torch.ones(c.hidden_size, dtype=dtype),
-    }
-    H = c.num_attention_heads * c.head_dim
-    KV = c.num_key_value_heads * c.head_dim
-    for i in range(c.num_hidden_layers):
-        state[f"layers.{i}.norm1.weight"] = torch.ones(c.hidden_size, dtype=dtype)
-        state[f"layers.{i}.norm2.weight"] = torch.ones(c.hidden_size, dtype=dtype)
-        state[f"layers.{i}.attn.q.weight"] = torch.randn(H, c.hidden_size, dtype=dtype) * 0.1
-        state[f"layers.{i}.attn.k.weight"] = torch.randn(KV, c.hidden_size, dtype=dtype) * 0.1
-        state[f"layers.{i}.attn.v.weight"] = torch.randn(KV, c.hidden_size, dtype=dtype) * 0.1
-        state[f"layers.{i}.attn.o.weight"] = torch.randn(c.hidden_size, H, dtype=dtype) * 0.1
-        state[f"layers.{i}.attn.q_norm.weight"] = torch.ones(c.head_dim, dtype=dtype)
-        state[f"layers.{i}.attn.k_norm.weight"] = torch.ones(c.head_dim, dtype=dtype)
-        state[f"layers.{i}.ffn.gate.weight"] = torch.randn(c.intermediate_size, c.hidden_size, dtype=dtype) * 0.1
-        state[f"layers.{i}.ffn.up.weight"] = torch.randn(c.intermediate_size, c.hidden_size, dtype=dtype) * 0.1
-        state[f"layers.{i}.ffn.down.weight"] = torch.randn(c.hidden_size, c.intermediate_size, dtype=dtype) * 0.1
-    return LoadedModel(state=state, config=cfg)
-
-
-def _identity_covariances(c: _Cfg, dtype: torch.dtype = torch.float64) -> list[torch.Tensor]:
-    return [torch.eye(c.hidden_size, dtype=dtype) for _ in range(c.num_hidden_layers)]
-
-
-def _calib_meta(c: _Cfg) -> dict:
-    return {
-        "model_id": "synthetic/tiny",
-        "num_layers": c.num_hidden_layers,
-        "hidden_size": c.hidden_size,
-        "token_count": 1024,
-        "dataset": "synthetic",
-        "seed": 0,
-    }
-
-
-def _build_mla_model(c: _Cfg, *, d_rope: int = 8, rank: int | None = None) -> tuple[Qwen3Model, dict]:
+def _build_mla_model(c: Cfg, *, d_rope: int = 8, rank: int | None = None) -> tuple[Qwen3Model, dict]:
     """Build a tiny Qwen3 model with MLA already swapped in. Returns (model, artifact)."""
-    loaded = _tiny_loaded(c, seed=1)
-    covs = _identity_covariances(c)
+    loaded = tiny_loaded(c, seed=1)
+    covs = identity_covariances(c)
     if rank is None:
         d_nope = c.head_dim - d_rope
         rank = min(c.num_key_value_heads * (d_nope + c.head_dim), c.hidden_size)
     artifact = convert_loaded_to_mla(
         loaded, covariances=covs, rank=rank, d_rope=d_rope,
-        factor_dtype=torch.float32, calibration_meta=_calib_meta(c),
+        factor_dtype=torch.float32, calibration_meta=calib_meta(c),
         target_model_id="synthetic/tiny",
     )
     model = Qwen3Model.from_loaded(loaded).eval()
@@ -162,7 +88,7 @@ def test_lora_after_perturbation_changes_output() -> None:
 
 def test_wrap_lora_targets_q_o_and_mlp_skips_mla_projections() -> None:
     """After apply_mla, wrap_lora hits q/o and MLP linears but never the new MLA projections."""
-    c = _Cfg()
+    c = Cfg()
     model, _ = _build_mla_model(c)
     n_wrapped = wrap_lora(model, rank=2, alpha=4.0)
     # Two layers × five leaf targets (q, o, gate, up, down) = 10.
@@ -191,7 +117,7 @@ def test_wrap_lora_substring_not_matched() -> None:
 
     Regression guard for the substring-vs-attr-name distinction.
     """
-    c = _Cfg()
+    c = Cfg()
     model, _ = _build_mla_model(c)
     wrap_lora(model, rank=2, alpha=4.0)
     for layer in model.layers:
@@ -205,7 +131,7 @@ def test_wrap_lora_substring_not_matched() -> None:
 
 
 def test_setup_trainable_unfreezes_only_mla_and_lora() -> None:
-    c = _Cfg()
+    c = Cfg()
     d_rope = 8
     rank = c.hidden_size // 2  # 32
     model, _ = _build_mla_model(c, d_rope=d_rope, rank=rank)
@@ -235,7 +161,7 @@ def test_setup_trainable_unfreezes_only_mla_and_lora() -> None:
 
 def test_setup_trainable_exact_param_counts() -> None:
     """Count every trainable param against a closed-form formula."""
-    c = _Cfg()
+    c = Cfg()
     d_rope = 8
     d_nope = c.head_dim - d_rope
     rank = c.hidden_size // 2  # 32
@@ -284,7 +210,7 @@ def test_cosine_warmup_shape() -> None:
 # --- Gradient flow / one-step decrease -----------------------------------
 
 
-def _build_tiny_trainable(c: _Cfg, d_rope: int = 8) -> tuple[Qwen3Model, "object"]:
+def _build_tiny_trainable(c: Cfg, d_rope: int = 8) -> tuple[Qwen3Model, "object"]:
     """Convenience: convert, wrap, set up trainable; return (model, inventory)."""
     model, _ = _build_mla_model(c, d_rope=d_rope)
     wrap_lora(model, rank=4, alpha=8.0)
@@ -298,7 +224,7 @@ def test_gradient_flow_through_mla_projections() -> None:
     Regression guard: if the KV-cache in-place write ever silently detached
     gradients on these matrices, training would stall here.
     """
-    c = _Cfg()
+    c = Cfg()
     model, inventory = _build_tiny_trainable(c, d_rope=8)
     model.train()
     torch.manual_seed(0)
@@ -324,7 +250,7 @@ def test_gradient_flow_through_mla_projections() -> None:
 
 def test_one_step_decreases_loss() -> None:
     """A single optimizer step on a fixed batch reduces loss measurably."""
-    c = _Cfg()
+    c = Cfg()
     model, inventory = _build_tiny_trainable(c, d_rope=8)
     optim = build_optimizer(inventory, lr_mla=1e-2, lr_lora=1e-2)
     model.train()
@@ -353,7 +279,7 @@ def test_one_step_decreases_loss() -> None:
 
 def test_gradient_checkpointing_forward_equivalence() -> None:
     """Toggling gradient_checkpointing must not change the output (training mode)."""
-    c = _Cfg()
+    c = Cfg()
     model, _ = _build_tiny_trainable(c, d_rope=8)
     model.train()
     torch.manual_seed(7)
@@ -375,7 +301,7 @@ def test_gradient_checkpointing_forward_equivalence() -> None:
 
 
 def test_save_load_trainable_roundtrip(tmp_path: Path) -> None:
-    c = _Cfg()
+    c = Cfg()
     model_a, inventory_a = _build_tiny_trainable(c, d_rope=8)
     optim = build_optimizer(inventory_a, lr_mla=1e-2, lr_lora=1e-2)
     model_a.train()
@@ -414,7 +340,7 @@ def test_train_loop_runs_synthetic(tmp_path: Path) -> None:
     no real model. Just exercises the wiring (loss, optim step, scheduler,
     eval hook, JSONL logging, best-ckpt saving).
     """
-    c = _Cfg()
+    c = Cfg()
     model, inventory = _build_tiny_trainable(c, d_rope=8)
     optim = build_optimizer(inventory, lr_mla=1e-2, lr_lora=1e-2)
 

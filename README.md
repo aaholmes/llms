@@ -1,5 +1,7 @@
 # Post-hoc MHA→MLA Conversion on a Single GPU
 
+[![tests](https://github.com/aaholmes/llms/actions/workflows/tests.yml/badge.svg)](https://github.com/aaholmes/llms/actions/workflows/tests.yml)
+
 > **Status — v0.1.** Stage A (engine) and Stage A.5 (Triton kernels) are complete and tested. Stage B (post-hoc MHA→MLA conversion of Qwen3-4B) has the full pipeline shipped end-to-end, including a **LoRA-based healing-finetune harness** (12 unit tests pass on the CPU dev machine; overnight GPU run pending), but **the headline 2 % PPL Δ at ≥4× compression gate is not yet met without healing FT** — see [Stage B perplexity results](#stage-b-perplexity-results). Stage C (joint compression × spec-decode sweep at fixed VRAM): pending.
 
 ## At a glance

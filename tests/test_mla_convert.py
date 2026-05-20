@@ -9,88 +9,16 @@ config — no HF download, no real models, fast (<5 s).
 from __future__ import annotations
 
 import json
-from dataclasses import dataclass
 
 import pytest
 import torch
-from transformers import PretrainedConfig
 
 from engine.model import Qwen3Model
 from engine.weights import LoadedModel
 from mla.convert import convert_loaded_to_mla, per_head_rope_pair_perm
 from mla.swap import alloc_mla_cache, apply_mla
 
-
-# --- tiny synthetic Qwen3-shaped fixture ----------------------------------
-
-@dataclass(frozen=True)
-class _Cfg:
-    vocab_size: int = 32
-    hidden_size: int = 64
-    num_hidden_layers: int = 2
-    num_attention_heads: int = 4
-    num_key_value_heads: int = 2
-    head_dim: int = 16
-    intermediate_size: int = 128
-    max_position_embeddings: int = 64
-    rms_norm_eps: float = 1e-6
-    rope_theta: float = 10000.0
-
-
-def _tiny_config(c: _Cfg) -> PretrainedConfig:
-    return PretrainedConfig(
-        vocab_size=c.vocab_size,
-        hidden_size=c.hidden_size,
-        num_hidden_layers=c.num_hidden_layers,
-        num_attention_heads=c.num_attention_heads,
-        num_key_value_heads=c.num_key_value_heads,
-        head_dim=c.head_dim,
-        intermediate_size=c.intermediate_size,
-        max_position_embeddings=c.max_position_embeddings,
-        rms_norm_eps=c.rms_norm_eps,
-        tie_word_embeddings=True,
-        rope_theta=c.rope_theta,
-        attention_bias=False,
-    )
-
-
-def _tiny_loaded(c: _Cfg, *, seed: int = 0, dtype: torch.dtype = torch.float32) -> LoadedModel:
-    torch.manual_seed(seed)
-    cfg = _tiny_config(c)
-    state: dict[str, torch.Tensor] = {
-        "embed.weight": torch.randn(c.vocab_size, c.hidden_size, dtype=dtype),
-        "final_norm.weight": torch.ones(c.hidden_size, dtype=dtype),
-    }
-    H = c.num_attention_heads * c.head_dim
-    KV = c.num_key_value_heads * c.head_dim
-    for i in range(c.num_hidden_layers):
-        state[f"layers.{i}.norm1.weight"] = torch.ones(c.hidden_size, dtype=dtype)
-        state[f"layers.{i}.norm2.weight"] = torch.ones(c.hidden_size, dtype=dtype)
-        state[f"layers.{i}.attn.q.weight"] = torch.randn(H, c.hidden_size, dtype=dtype) * 0.1
-        state[f"layers.{i}.attn.k.weight"] = torch.randn(KV, c.hidden_size, dtype=dtype) * 0.1
-        state[f"layers.{i}.attn.v.weight"] = torch.randn(KV, c.hidden_size, dtype=dtype) * 0.1
-        state[f"layers.{i}.attn.o.weight"] = torch.randn(c.hidden_size, H, dtype=dtype) * 0.1
-        state[f"layers.{i}.attn.q_norm.weight"] = torch.ones(c.head_dim, dtype=dtype)
-        state[f"layers.{i}.attn.k_norm.weight"] = torch.ones(c.head_dim, dtype=dtype)
-        state[f"layers.{i}.ffn.gate.weight"] = torch.randn(c.intermediate_size, c.hidden_size, dtype=dtype) * 0.1
-        state[f"layers.{i}.ffn.up.weight"] = torch.randn(c.intermediate_size, c.hidden_size, dtype=dtype) * 0.1
-        state[f"layers.{i}.ffn.down.weight"] = torch.randn(c.hidden_size, c.intermediate_size, dtype=dtype) * 0.1
-    return LoadedModel(state=state, config=cfg)
-
-
-def _identity_covariances(c: _Cfg, dtype: torch.dtype = torch.float64) -> list[torch.Tensor]:
-    return [torch.eye(c.hidden_size, dtype=dtype) for _ in range(c.num_hidden_layers)]
-
-
-def _calib_meta(c: _Cfg, *, model_id: str = "synthetic/tiny", token_count: int = 1024) -> dict:
-    return {
-        "model_id": model_id,
-        "num_layers": c.num_hidden_layers,
-        "hidden_size": c.hidden_size,
-        "token_count": token_count,
-        "dataset": "synthetic",
-        "seed": 0,
-    }
+from ._tiny import Cfg, calib_meta, identity_covariances, tiny_loaded
 
 
 def _baseline_logits(loaded: LoadedModel, prompt_ids: torch.Tensor) -> torch.Tensor:
@@ -110,7 +38,7 @@ def _mla_logits(loaded: LoadedModel, artifact: dict, prompt_ids: torch.Tensor) -
 
 # --- tests ----------------------------------------------------------------
 
-def _max_joint_rank(c: _Cfg, d_rope: int) -> int:
+def _max_joint_rank(c: Cfg, d_rope: int) -> int:
     """Highest rank at which joint-SVD reconstruction of [W_K_nope; W_V] is lossless."""
     d_nope = c.head_dim - d_rope
     return min(c.num_key_value_heads * (d_nope + c.head_dim), c.hidden_size)
@@ -125,10 +53,10 @@ def test_factor_level_full_rank_lossless(d_rope: int) -> None:
     against ``PartialRoPEAttention`` is covered by ``test_mla_attention.py``;
     here we check that the SVD primitive correctly factors the per-layer K/V.
     """
-    c = _Cfg()
+    c = Cfg()
     rank = _max_joint_rank(c, d_rope)
     d_nope = c.head_dim - d_rope
-    loaded = _tiny_loaded(c, seed=1, dtype=torch.float64)
+    loaded = tiny_loaded(c, seed=1, dtype=torch.float64)
 
     torch.manual_seed(3)
     covs = []
@@ -142,7 +70,7 @@ def test_factor_level_full_rank_lossless(d_rope: int) -> None:
         rank=rank,
         d_rope=d_rope,
         factor_dtype=torch.float64,
-        calibration_meta=_calib_meta(c),
+        calibration_meta=calib_meta(c),
     )
 
     perm = per_head_rope_pair_perm(c.head_dim, d_rope)
@@ -213,11 +141,11 @@ def test_factor_level_full_rank_lossless(d_rope: int) -> None:
 @pytest.mark.parametrize("d_rope", [0, 8])
 def test_factor_level_exact_low_rank_recovery(d_rope: int) -> None:
     """W_K_nope and W_V constructed from rank-r₀ factors → recovery at rank=r₀ is exact in fp64."""
-    c = _Cfg()
+    c = Cfg()
     rank = 16  # exact construction rank
     d_nope = c.head_dim - d_rope
 
-    loaded = _tiny_loaded(c, seed=7, dtype=torch.float64)
+    loaded = tiny_loaded(c, seed=7, dtype=torch.float64)
 
     perm = per_head_rope_pair_perm(c.head_dim, d_rope)
     nope_rows = [
@@ -270,7 +198,7 @@ def test_factor_level_exact_low_rank_recovery(d_rope: int) -> None:
         rank=rank,
         d_rope=d_rope,
         factor_dtype=torch.float64,
-        calibration_meta=_calib_meta(c),
+        calibration_meta=calib_meta(c),
     )
 
     for i in range(c.num_hidden_layers):
@@ -298,15 +226,15 @@ def test_full_rank_full_rope_end_to_end_matches_baseline() -> None:
     differ by design (that's the point), so end-to-end equivalence is not
     expected and is not tested here.
     """
-    c = _Cfg()
-    loaded = _tiny_loaded(c, seed=1)
-    covs = _identity_covariances(c)
+    c = Cfg()
+    loaded = tiny_loaded(c, seed=1)
+    covs = identity_covariances(c)
     d_rope = c.head_dim
     rank = _max_joint_rank(c, d_rope)
 
     artifact = convert_loaded_to_mla(
         loaded, covariances=covs, rank=rank, d_rope=d_rope,
-        factor_dtype=torch.float32, calibration_meta=_calib_meta(c),
+        factor_dtype=torch.float32, calibration_meta=calib_meta(c),
     )
 
     torch.manual_seed(11)
@@ -321,9 +249,9 @@ def test_full_rank_full_rope_end_to_end_matches_baseline() -> None:
 
 def test_artifact_serialization_bit_exact(tmp_path) -> None:
     """Convert → torch.save → torch.load → every weight bit-exact; sidecar json valid."""
-    c = _Cfg()
-    loaded = _tiny_loaded(c, seed=2)
-    covs = _identity_covariances(c)
+    c = Cfg()
+    loaded = tiny_loaded(c, seed=2)
+    covs = identity_covariances(c)
 
     artifact = convert_loaded_to_mla(
         loaded,
@@ -331,7 +259,7 @@ def test_artifact_serialization_bit_exact(tmp_path) -> None:
         rank=c.hidden_size // 2,
         d_rope=8,
         factor_dtype=torch.float32,
-        calibration_meta=_calib_meta(c),
+        calibration_meta=calib_meta(c),
     )
 
     out_path = tmp_path / "artifact.pt"
@@ -353,11 +281,11 @@ def test_artifact_serialization_bit_exact(tmp_path) -> None:
 
 def test_calibration_model_id_mismatch_raises() -> None:
     """A calibration artifact with the wrong model_id must be rejected up front."""
-    c = _Cfg()
-    loaded = _tiny_loaded(c, seed=3)
-    covs = _identity_covariances(c)
+    c = Cfg()
+    loaded = tiny_loaded(c, seed=3)
+    covs = identity_covariances(c)
 
-    bad_meta = _calib_meta(c, model_id="other/model")
+    bad_meta = calib_meta(c, model_id="other/model")
 
     with pytest.raises(ValueError, match="model_id"):
         convert_loaded_to_mla(
@@ -373,9 +301,9 @@ def test_calibration_model_id_mismatch_raises() -> None:
 
 def test_calibration_layer_count_mismatch_raises() -> None:
     """Number of covariance matrices must match the model's layer count."""
-    c = _Cfg()
-    loaded = _tiny_loaded(c, seed=4)
-    short_covs = _identity_covariances(c)[:-1]
+    c = Cfg()
+    loaded = tiny_loaded(c, seed=4)
+    short_covs = identity_covariances(c)[:-1]
 
     with pytest.raises(ValueError, match="layer"):
         convert_loaded_to_mla(
@@ -384,43 +312,43 @@ def test_calibration_layer_count_mismatch_raises() -> None:
             rank=c.hidden_size,
             d_rope=8,
             factor_dtype=torch.float32,
-            calibration_meta=_calib_meta(c),
+            calibration_meta=calib_meta(c),
         )
 
 
 def test_invalid_rank_raises() -> None:
-    c = _Cfg()
-    loaded = _tiny_loaded(c, seed=5)
-    covs = _identity_covariances(c)
+    c = Cfg()
+    loaded = tiny_loaded(c, seed=5)
+    covs = identity_covariances(c)
 
     with pytest.raises(ValueError, match="rank"):
         convert_loaded_to_mla(
             loaded, covariances=covs, rank=c.hidden_size + 1, d_rope=8,
-            factor_dtype=torch.float32, calibration_meta=_calib_meta(c),
+            factor_dtype=torch.float32, calibration_meta=calib_meta(c),
         )
 
 
 def test_invalid_d_rope_raises() -> None:
-    c = _Cfg()
-    loaded = _tiny_loaded(c, seed=6)
-    covs = _identity_covariances(c)
+    c = Cfg()
+    loaded = tiny_loaded(c, seed=6)
+    covs = identity_covariances(c)
 
     with pytest.raises(ValueError, match="d_rope"):
         convert_loaded_to_mla(
             loaded, covariances=covs, rank=c.hidden_size, d_rope=c.head_dim + 1,
-            factor_dtype=torch.float32, calibration_meta=_calib_meta(c),
+            factor_dtype=torch.float32, calibration_meta=calib_meta(c),
         )
 
 
 def test_apply_mla_idempotent() -> None:
     """Calling apply_mla twice on the same model is a no-op the second time."""
-    c = _Cfg()
-    loaded = _tiny_loaded(c, seed=8)
-    covs = _identity_covariances(c)
+    c = Cfg()
+    loaded = tiny_loaded(c, seed=8)
+    covs = identity_covariances(c)
 
     artifact = convert_loaded_to_mla(
         loaded, covariances=covs, rank=_max_joint_rank(c, 8), d_rope=8,
-        factor_dtype=torch.float32, calibration_meta=_calib_meta(c),
+        factor_dtype=torch.float32, calibration_meta=calib_meta(c),
     )
     model = Qwen3Model.from_loaded(loaded).eval()
     apply_mla(model, artifact)
@@ -437,13 +365,13 @@ def test_apply_mla_idempotent() -> None:
 
 def test_artifact_metadata_records_diagnostics() -> None:
     """Per-layer diagnostics (discarded energy, ridge used) appear in meta."""
-    c = _Cfg()
-    loaded = _tiny_loaded(c, seed=9)
-    covs = _identity_covariances(c)
+    c = Cfg()
+    loaded = tiny_loaded(c, seed=9)
+    covs = identity_covariances(c)
 
     artifact = convert_loaded_to_mla(
         loaded, covariances=covs, rank=c.hidden_size // 2, d_rope=8,
-        factor_dtype=torch.float32, calibration_meta=_calib_meta(c),
+        factor_dtype=torch.float32, calibration_meta=calib_meta(c),
     )
     diag = artifact["meta"]["per_layer_diagnostics"]
     assert len(diag) == c.num_hidden_layers

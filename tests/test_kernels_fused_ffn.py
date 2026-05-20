@@ -200,10 +200,12 @@ def test_triton_preserves_leading_dims():
     assert diff < 1e-2 * ref_max + 1e-2
 
 
+@pytest.mark.requires_triton
 def test_shape_mismatch_raises():
     """Wrapper rejects inputs with mismatched K or N dims, with clear errors.
 
-    CPU-only — no CUDA needed for arg validation.
+    Validates argument-checking only — no CUDA needed, but ``kernels.fused_ffn``
+    imports ``triton`` at module load so the test is gated on triton availability.
     """
     from kernels.fused_ffn import triton_fused_gate_up_silu
 
@@ -330,6 +332,9 @@ def test_ffn_module_logits_match(draft_model_id, dtype, logit_atol):
     ), f"dtype={dtype} last-token argmax disagreement"
 
 
+@pytest.mark.requires_draft
+@pytest.mark.requires_cuda
+@pytest.mark.requires_triton
 def test_apply_triton_kernels_idempotent(_draft_loaded_bf16):
     """Calling ``apply_triton_kernels`` twice should not stack wrappers."""
     from engine.model import Qwen3Model
@@ -386,9 +391,13 @@ def test_prewarm_runs_clean(_draft_loaded_bf16):
     )
 
 
+@pytest.mark.requires_triton
 def test_prewarm_no_op_without_triton_modules():
-    """``prewarm_triton_kernels`` on a model with no Triton modules is a no-op
-    (covers the M2 dev path where the kernel package isn't wired in)."""
+    """``prewarm_triton_kernels`` on a model with no Triton modules is a no-op.
+
+    The function body itself is platform-agnostic, but ``kernels.swap`` imports
+    ``triton`` transitively, so the test is gated on triton availability.
+    """
     from kernels.swap import prewarm_triton_kernels
 
     plain = nn.Sequential(nn.Linear(4, 4))  # no .layers, no TritonFFN

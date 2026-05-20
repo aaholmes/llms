@@ -1,0 +1,36 @@
+name: tests
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  cpu-tests:
+    name: CPU-only test subset
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v3
+        with:
+          enable-cache: true
+
+      - name: Set up Python 3.12
+        run: uv python install 3.12
+
+      - name: Install dependencies
+        run: uv sync
+
+      # Skip markers that require external resources we don't have on the CI
+      # runner: NVIDIA CUDA, Triton, and Hugging Face model weights for
+      # Qwen3-4B / Qwen3-0.6B. The remaining tests cover the engine, MLA
+      # primitives, the heal harness, and the synthetic conversion path —
+      # everything that runs on M2-class hardware.
+      - name: Run CPU-only tests
+        run: >
+          uv run pytest
+          -m "not requires_target and not requires_draft and not requires_cuda and not requires_triton"
+          -v --color=yes
