@@ -74,6 +74,12 @@ class DecoderBlock(nn.Module):
 
 
 class Qwen3Model(nn.Module):
+    # When True, each DecoderBlock's forward is wrapped in
+    # torch.utils.checkpoint.checkpoint so activations are recomputed during
+    # backward — trades ~30% throughput for ~5× lower peak activation memory.
+    # Off by default; the inference path is unchanged.
+    gradient_checkpointing: bool = False
+
     def __init__(self, cfg: PretrainedConfig) -> None:
         super().__init__()
         self.cfg = cfg
@@ -111,6 +117,18 @@ class Qwen3Model(nn.Module):
         sin = self.rope_sin[start_pos : start_pos + T].to(h.dtype)
 
         for i, layer in enumerate(self.layers):
+            if self.gradient_checkpointing and self.training:
+                h = torch.utils.checkpoint.checkpoint(
+                    layer,
+                    h,
+                    kv_cache=kv_cache,
+                    layer_idx=i,
+                    cos=cos,
+                    sin=sin,
+                    start_pos=start_pos,
+                    use_reentrant=False,
+                )
+                continue
             h = layer(
                 h,
                 kv_cache=kv_cache,
