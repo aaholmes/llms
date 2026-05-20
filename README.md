@@ -1,6 +1,34 @@
 # Post-hoc MHA→MLA Conversion on a Single GPU
 
-> **Status — v0.1.** Stage A (engine) and Stage A.5 (Triton kernels) are complete and tested. Stage B (post-hoc MHA→MLA conversion of Qwen3-4B) has the full pipeline shipped end-to-end, but **the headline 2 % PPL Δ at ≥4× compression gate is not yet met without a healing finetune** — see [Stage B perplexity results](#stage-b-perplexity-results). Stage C (joint compression × spec-decode sweep at fixed VRAM): pending.
+> **Status — v0.1.** Stage A (engine) and Stage A.5 (Triton kernels) are complete and tested. Stage B (post-hoc MHA→MLA conversion of Qwen3-4B) has the full pipeline shipped end-to-end, including a **LoRA-based healing-finetune harness** (12 unit tests pass on the CPU dev machine; overnight GPU run pending), but **the headline 2 % PPL Δ at ≥4× compression gate is not yet met without healing FT** — see [Stage B perplexity results](#stage-b-perplexity-results). Stage C (joint compression × spec-decode sweep at fixed VRAM): pending.
+
+## At a glance
+
+**What.** A from-scratch single-GPU inference engine for Qwen3 that doubles as a research harness for **post-hoc MHA→MLA conversion** — turn an existing trained model's attention into DeepSeek-style multi-head latent attention, then study how the resulting KV-cache compression interacts with speculative decoding at a fixed 16 GB VRAM budget.
+
+**Why.** On a 16 GB consumer GPU, the KV cache is the binding constraint on context length and the dominant source of HBM traffic at decode time. MLA shrinks it ~4–8× in models that were trained with it; this project is asking what falls out if you bolt the same compression onto an existing MHA/GQA model after the fact, without retraining (or with only a small LoRA "healing" finetune).
+
+**Hardware.** Single-GPU, 16 GB VRAM, Blackwell-class consumer card for runs; a separate dev machine for engine and conversion dev.
+
+**Status (v0.1, May 2026).**
+- **Engine** (Stage A) — bit-exact with HuggingFace on Qwen3-0.6B; **1.29× spec-decode speedup** at K=2–3 on Qwen3-4B target + Qwen3-0.6B draft (100 Dolly prompts).
+- **Triton kernels** (Stage A.5) — fused `gate-up-silu` and `QKV` shipped; isolation microbench wins of 1.05× / 1.5–3×. The 1.5× **end-to-end** gate is missed at batch=1 BF16: the model is HBM-bound and launch overhead × spec-call count erodes the per-call gain.
+- **MHA→MLA conversion** (Stage B) — full pipeline shipped: covariance calibration, activation-aware joint SVD over `[K_nope; V]`, partial-RoPE-aware swap, PPL sweep, **plus a LoRA + small-full-FT healing harness** (`src/mla/heal.py`) ready for the overnight GPU run. Headline 2 % PPL Δ at 4× compression gate **not yet met without finetuning**: best no-FT point is **+826 % PPL Δ at 4×** (`r256_drope32`); the V-only fallback is clean at **+25–38 % PPL Δ** but caps at 1.45×. The healing-FT run is the next gate.
+- **Joint compression × spec-decode sweep** (Stage C) — pending.
+
+**Code map.**
+- `src/engine/` — manual Qwen3 forward pass, KV cache, spec-decode loop, `MLAttention` runtime
+- `src/kernels/` — Triton fused gate-up-silu + QKV
+- `src/mla/` — covariance collector (`calibrate.py`), activation-aware SVD (`svd.py`), conversion (`convert.py`), post-hoc swap (`swap.py`), **healing finetune (`heal.py`)**
+- `src/bench/` — streaming PPL evaluator, demo, e2e bench
+- `experiments/stage_b/` — calibration artifacts, conversion checkpoints, PPL sweep summaries
+
+**One command per stage** (Qwen3-4B target):
+```bash
+uv run python -m mla.calibrate Qwen/Qwen3-4B --samples 1000 --chunk-tokens 256 --out experiments/stage_b/calib/wt103_1k.pt
+uv run python -m mla.convert  Qwen/Qwen3-4B --rank 256 --d-rope 32 --calib wt103-1k
+uv run python -m mla.heal     --mla-artifact experiments/stage_b/qwen_qwen3_4b_r256_drope32.pt --out experiments/stage_b/heal_r256_drope32
+```
 
 ## What this is, why it matters
 
@@ -20,11 +48,12 @@ Hard-gated stages; see `DESIGN.md` for the plan, hardware, and the future-extens
 - **Stage A.5 — Triton kernel** — done. Two fused Triton kernels (gate-up-silu, QKV projection) shipped with microbench wins of 1.05× and 1.50–2.98×; both clear isolation gates but do not improve the spec-decode hot path end-to-end. The 1.5× e2e ship gate was missed: at batch=1 in BF16 the target model is HBM-bandwidth-bound, and per-call kernel-launch overhead × ~14k spec calls per generation erodes the per-call gain.
 - **Stage B — MLA conversion** — in progress.
   - ✅ **Activation-aware SVD primitive.** Pure-CPU fp64 routine that, given a weight matrix `W` and an activation covariance `C`, returns rank-`r` factors `(A, B)` minimizing `‖(W − AB) X‖_F` over the calibration distribution (not the unweighted Frobenius distance — this is the difference between the math working and not). 8 tests, including ridge backoff for ill-conditioned `C`.
-  - ✅ **Per-layer covariance collector.** Forward-hook pipeline that streams a calibration corpus (1k × 256-token chunks of WikiText-103) through the engine and accumulates `C_ℓ = (1/N) Σ x_t x_tᵀ` per attention layer. **256k tokens accumulated through Qwen3-4B in 9.4 min on the 5060 Ti**; all 36 layers symmetric and positive semidefinite, conditioning ~10⁴–10⁵ — well inside the default ridge regime. 9 tests.
+  - ✅ **Per-layer covariance collector.** Forward-hook pipeline that streams a calibration corpus (1k × 256-token chunks of WikiText-103) through the engine and accumulates `C_ℓ = (1/N) Σ x_t x_tᵀ` per attention layer. **256k tokens accumulated through Qwen3-4B in 9.4 min on the 16 GB GPU**; all 36 layers symmetric and positive semidefinite, conditioning ~10⁴–10⁵ — well inside the default ridge regime. 9 tests.
   - ✅ **MLAttention runtime + compressed KV cache.** Drop-in replacement for the engine's standard attention module that consumes already-computed MLA factors, applies partial-RoPE per head, and serves attention against a cache storing `(c_kv, k_rope_pre)` per token. Single-norm-on-concatenated-K mode preserves *algebraic* equivalence to baseline GQA attention given full-rank factors — verified to ≤1e-5 in fp32 and ≤1e-10 in fp64. 12 tests covering a `d_rope` sweep, prefill+decode, and exact-low-rank construction.
   - ✅ **Conversion CLI + post-hoc swap.** `python -m mla.convert <hf-id> --rank ... --d-rope ... --calib ...` reads the calibration artifact and runs one *joint* SVD per layer over the stacked `[W_K_nope; W_V]` rows — joint factoring is what makes the down-projection `W_dkv` shared across K-nope and V (the whole point of MLA's compressed cache). Output is a self-contained `.pt` artifact swapped into a fresh `Qwen3Model` via `apply_mla(...)`. 14 synthetic tests + 2 real-Qwen3-0.6B end-to-end smokes. **Qwen3-4B converts in 55 s on CPU** at `rank=128, d_rope=32`, giving a structural KV-cache compression of **5.33×** before perplexity is even measured (target was ≥4×).
   - ✅ **Perplexity sweep on Qwen3-4B.** Streaming PPL over a held-out 250-chunk × 1024-token slice of WikiText-103 validation (disjoint from the train-split calibration). Two grids run: the headline `partial-rope` design and a `v-only` fallback (`d_rope = head_dim`, no nope subspace, K stays full-RoPE). **The 2% PPL Δ at ≥4× compression hard gate was *not* met at this calibration with no finetuning** — see results below.
   - ✅ **Partial-RoPE pair-structure fix (v2).** The first sweep used a `d_rope`-sized RoPE table that re-paired and re-frequencied the rope subspace in a way the trained model has never seen. Replaced with sliced-original-`inv_freq` plus a head-dim permutation at conversion time so the rope subspace is the first `d_rope/2` *original* Qwen3 RoPE pairs, contiguous at the end of each head. The fix turned the 4×-compression operating point (`r256_drope32`) from PPL Δ +9,080 % into **+826 %** — an 11× drop. Lower-rank operating points still fail the 2 % Δ gate, but for SVD-rank reasons that the partial-RoPE fix can't address.
+  - ✅ **Healing-finetune harness** (`src/mla/heal.py`). Hybrid trainable scope chosen to fit Qwen3-4B FT in 16 GB: **full FT on the new MLA projections** (`dkv`, `uk_nope`, `uv`, `kr` — SVD-init'd and need to *move*, not just receive a low-rank delta) **plus LoRA r=16 on Q/O and the MLP** (`gate`/`up`/`down`); embeddings, RMSNorms, and base projections stay frozen. AdamW with two LR groups (5e-5 / 1e-4), cosine schedule with 3 % warmup, gradient checkpointing per `DecoderBlock`. Validation hook calls the existing streaming PPL evaluator on a held-out WikiText-103 slice every N steps; best-val checkpoint persists only the ~90 M trainable params. 12 unit tests pass on the CPU dev machine — including an explicit gradient-flow check through the MLA projections (regression guard against the KV-cache write detaching gradients). **The overnight Qwen3-4B run is the next gate.**
 - **Stage C — joint sweep at fixed VRAM** — pending. How target-compression × draft-compression × spec-decode-K trade off at a fixed 16 GB VRAM budget. Three named regimes — both uncompressed, target only, both compressed at matched ratios — directly test whether coupling SVD distortion across target and draft preserves spec-decode acceptance relative to compressing the target alone.
 
 ## Stage B perplexity results
@@ -59,7 +88,7 @@ The fix dramatically improves moderate-rank points (r256, r192, r128_drope64) an
 | r256_drope128 | 256 | 128 | 2560 | 1.60× | 35.45 | +63.8 % |
 | r128_drope128 | 128 | 128 | 2304 | 1.78× | 89.86 | +315.2 % |
 
-**What this means for Stage C.** The 2 % PPL Δ at ≥4× compression headline gate is still not met. The remaining gap is **rank-deficient SVD reconstruction**, not RoPE structure — every published post-hoc MHA→MLA paper closes this gap with a healing finetune (LoRA on the latent factors for a few thousand steps), which is the project plan's `B.stretch-2 (LoRA healing-FT)` contingency. Without that, two operating zones are usable:
+**What this means for the next step.** The 2 % PPL Δ at ≥4× compression headline gate is still not met. The remaining gap is **rank-deficient SVD reconstruction**, not RoPE structure — every published post-hoc MHA→MLA paper closes this gap with a healing finetune (LoRA on the latent factors and the surrounding MLP, for a fraction of a percent of pretraining tokens). That harness now exists in `src/mla/heal.py` and passes its unit tests on the CPU dev machine; the next gate is the overnight 16 GB GPU run on Qwen3-4B (`r256_drope32` and `r512_drope128` configs in series). Until those results land, two no-FT operating zones are usable:
 
 - **Aggressive (4× compression, +826 % PPL)**: `r256_drope32`. Quality is bad enough that this is only useful in the speculative-decoding setting where the target is unchanged and the MLA-converted draft just needs to *agree often enough* with the target — a question Stage C explicitly studies.
 - **Conservative (1.33–1.45× compression, +25–38 % PPL)**: V-only at rank 384–512. Smaller compression but the quality cost is bounded, and this is the "no-FT, deployment-safe" zone.
@@ -68,7 +97,7 @@ Raw artifacts: `experiments/stage_b/eval_summary_partial_rope_v2.md` (the fixed 
 
 ## Engine speedups (Stage A end-to-end)
 
-100 Dolly-15k prompts × 200 generated tokens, Qwen3-4B target in BF16 on RTX 5060 Ti 16 GB. Greedy baseline: **38.9 tok/s** (matches HuggingFace's `AutoModelForCausalLM` greedy at `use_cache=True` to one decimal place).
+100 Dolly-15k prompts × 200 generated tokens, Qwen3-4B target in BF16 on a 16 GB Blackwell-class consumer GPU. Greedy baseline: **38.9 tok/s** (matches HuggingFace's `AutoModelForCausalLM` greedy at `use_cache=True` to one decimal place).
 
 | draft | K=1 | K=2 | K=3 | K=4 | K=5 | K=7 |
 |---|---:|---:|---:|---:|---:|---:|
@@ -79,7 +108,7 @@ Raw artifacts: `experiments/stage_b/eval_summary_partial_rope_v2.md` (the fixed 
 
 ## Hardware
 
-Target: RTX 5060 Ti 16 GB (Blackwell). Engine and conversion development on a MacBook M2 (CPU/MPS); Triton, profiling, calibration runs, and the sweeps on the CUDA desktop.
+Target: a single 16 GB Blackwell-class consumer GPU. Engine and conversion development on a dev machine; Triton, profiling, calibration runs, and the sweeps on a CUDA desktop.
 
 ## License
 
