@@ -383,11 +383,11 @@ def test_artifact_metadata_records_diagnostics() -> None:
 
 def test_calibration_missing_model_id_warns(caplog) -> None:
     """A calibration artifact without a model_id skips the match check loudly."""
-    c = _Cfg()
-    loaded = _tiny_loaded(c, seed=10)
-    covs = _identity_covariances(c)
+    c = Cfg()
+    loaded = tiny_loaded(c, seed=10)
+    covs = identity_covariances(c)
 
-    meta = _calib_meta(c)
+    meta = calib_meta(c)
     del meta["model_id"]
 
     with caplog.at_level(logging.WARNING, logger="mla.convert"):
