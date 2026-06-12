@@ -99,6 +99,8 @@ class Qwen3Model(nn.Module):
             base=_rope_theta(cfg),
             dtype=torch.float32,
         )
+        # Computed in float32 for precision; as registered buffers they follow
+        # module-level .to(dtype=...), so forward needs no per-call cast.
         self.register_buffer("rope_cos", cos, persistent=False)
         self.register_buffer("rope_sin", sin, persistent=False)
 
@@ -113,8 +115,8 @@ class Qwen3Model(nn.Module):
         T = input_ids.shape[1]
 
         h = self.embed(input_ids)
-        cos = self.rope_cos[start_pos : start_pos + T].to(h.dtype)
-        sin = self.rope_sin[start_pos : start_pos + T].to(h.dtype)
+        cos = self.rope_cos[start_pos : start_pos + T]
+        sin = self.rope_sin[start_pos : start_pos + T]
 
         for i, layer in enumerate(self.layers):
             if self.gradient_checkpointing and self.training:

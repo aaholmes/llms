@@ -7,11 +7,12 @@ from __future__ import annotations
 
 import pytest
 import torch
+from transformers import PretrainedConfig
 
 from engine.model import Qwen3Model
 from engine.sampler import greedy
-from engine.spec_decode import speculative_generate
-from engine.weights import load_weights
+from engine.spec_decode import spec_decode_round, speculative_generate
+from engine.weights import LoadedModel, load_weights
 
 
 PROMPTS = [
@@ -48,6 +49,63 @@ def _greedy_generate(model: Qwen3Model, prompt_ids: torch.Tensor, n_new: int) ->
             next_tok = greedy(logits[:, -1, :]).unsqueeze(0)
             out.append(int(next_tok.item()))
     return out
+
+
+def _tiny_model(seed: int = 0) -> Qwen3Model:
+    """Tiny synthetic Qwen3-shaped model (mirrors tests/test_mla_convert.py)."""
+    torch.manual_seed(seed)
+    vocab, hidden, layers, n_heads, n_kv, head_dim, inter = 32, 64, 2, 4, 2, 16, 128
+    cfg = PretrainedConfig(
+        vocab_size=vocab,
+        hidden_size=hidden,
+        num_hidden_layers=layers,
+        num_attention_heads=n_heads,
+        num_key_value_heads=n_kv,
+        head_dim=head_dim,
+        intermediate_size=inter,
+        max_position_embeddings=64,
+        rms_norm_eps=1e-6,
+        tie_word_embeddings=True,
+        rope_theta=10000.0,
+        attention_bias=False,
+    )
+    state: dict[str, torch.Tensor] = {
+        "embed.weight": torch.randn(vocab, hidden),
+        "final_norm.weight": torch.ones(hidden),
+    }
+    H, KV = n_heads * head_dim, n_kv * head_dim
+    for i in range(layers):
+        state[f"layers.{i}.norm1.weight"] = torch.ones(hidden)
+        state[f"layers.{i}.norm2.weight"] = torch.ones(hidden)
+        state[f"layers.{i}.attn.q.weight"] = torch.randn(H, hidden) * 0.1
+        state[f"layers.{i}.attn.k.weight"] = torch.randn(KV, hidden) * 0.1
+        state[f"layers.{i}.attn.v.weight"] = torch.randn(KV, hidden) * 0.1
+        state[f"layers.{i}.attn.o.weight"] = torch.randn(hidden, H) * 0.1
+        state[f"layers.{i}.attn.q_norm.weight"] = torch.ones(head_dim)
+        state[f"layers.{i}.attn.k_norm.weight"] = torch.ones(head_dim)
+        state[f"layers.{i}.ffn.gate.weight"] = torch.randn(inter, hidden) * 0.1
+        state[f"layers.{i}.ffn.up.weight"] = torch.randn(inter, hidden) * 0.1
+        state[f"layers.{i}.ffn.down.weight"] = torch.randn(hidden, inter) * 0.1
+    return Qwen3Model.from_loaded(LoadedModel(state=state, config=cfg)).eval()
+
+
+def test_spec_decode_round_rejects_empty_pending():
+    """Empty pending violates the round invariant: pending must hold at least
+    the bridge token (last-known token) for the draft to condition on.
+    """
+    model = _tiny_model()
+    target_cache = model.alloc_cache(32)
+    draft_cache = model.alloc_cache(32)
+    with pytest.raises(ValueError, match="bridge token"):
+        spec_decode_round(
+            target=model,
+            draft=model,
+            target_cache=target_cache,
+            draft_cache=draft_cache,
+            pending=[],
+            K=4,
+            device="cpu",
+        )
 
 
 @pytest.mark.requires_draft

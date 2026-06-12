@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import logging
 import re
 import subprocess
 import sys
@@ -32,6 +33,8 @@ import torch
 
 from engine.weights import LoadedModel, load_weights
 from mla.svd import activation_aware_factor, discarded_singular_energy
+
+logger = logging.getLogger(__name__)
 
 
 def per_head_rope_pair_perm(head_dim: int, d_rope: int) -> list[int]:
@@ -129,7 +132,13 @@ def convert_loaded_to_mla(
         )
     if calibration_meta is not None and target_model_id is not None:
         calib_id = calibration_meta.get("model_id")
-        if calib_id is not None and calib_id != target_model_id:
+        if calib_id is None:
+            logger.warning(
+                "calibration artifact has no model_id; skipping match check "
+                "against target model_id=%r",
+                target_model_id,
+            )
+        elif calib_id != target_model_id:
             raise ValueError(
                 f"calibration model_id={calib_id!r} does not match target "
                 f"model_id={target_model_id!r}"

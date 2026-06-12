@@ -9,6 +9,7 @@ config — no HF download, no real models, fast (<5 s).
 from __future__ import annotations
 
 import json
+import logging
 
 import pytest
 import torch
@@ -378,3 +379,21 @@ def test_artifact_metadata_records_diagnostics() -> None:
     for entry in diag:
         assert "discarded_energy" in entry
         assert entry["discarded_energy"] >= 0.0
+
+
+def test_calibration_missing_model_id_warns(caplog) -> None:
+    """A calibration artifact without a model_id skips the match check loudly."""
+    c = _Cfg()
+    loaded = _tiny_loaded(c, seed=10)
+    covs = _identity_covariances(c)
+
+    meta = _calib_meta(c)
+    del meta["model_id"]
+
+    with caplog.at_level(logging.WARNING, logger="mla.convert"):
+        convert_loaded_to_mla(
+            loaded, covariances=covs, rank=_max_joint_rank(c, 8), d_rope=8,
+            factor_dtype=torch.float32, calibration_meta=meta,
+            target_model_id="synthetic/tiny",
+        )
+    assert any("no model_id" in r.message for r in caplog.records)

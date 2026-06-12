@@ -502,3 +502,20 @@ def test_mla_kv_cache_truncate() -> None:
     cache.cur_len = 5
     with pytest.raises(ValueError):
         cache.truncate(6)
+
+
+@pytest.mark.parametrize("d_rope", [-1, CFG.head_dim + 1])
+def test_constructor_rejects_out_of_bounds_d_rope(d_rope: int) -> None:
+    with pytest.raises(ValueError, match="d_rope"):
+        MLAttention(
+            hidden_size=CFG.hidden_size,
+            num_heads=CFG.num_heads,
+            num_kv_heads=CFG.num_kv_heads,
+            head_dim=CFG.head_dim,
+            rms_eps=CFG.rms_eps,
+            rank=CFG.hidden_size,
+            d_rope=d_rope,
+            max_position_embeddings=CFG.max_pos,
+            rope_theta=CFG.rope_theta,
+            qk_norm_mode="single",
+        )

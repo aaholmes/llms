@@ -78,7 +78,12 @@ def spec_decode_round(
         )
     L = target_cache.cur_len
     P = len(pending)
-    assert P >= 1
+    if P < 1:
+        raise ValueError(
+            "pending must hold at least one token (the bridge token): the round "
+            "needs a last-known token to condition the draft on, and the prior "
+            "round always leaves the corrected/bonus token in pending."
+        )
 
     # --- Draft phase: feed pending then sample K tokens autoregressively. ---
     pending_t = torch.tensor([pending], dtype=torch.long, device=device)

@@ -20,9 +20,12 @@ All math runs in fp64; the caller is responsible for the final dtype cast.
 
 from __future__ import annotations
 
+import logging
 from dataclasses import dataclass
 
 import torch
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass
@@ -48,13 +51,23 @@ def _ridge_cholesky(
     eye = torch.eye(d, dtype=C.dtype, device=C.device)
 
     lam = ridge_lambda
-    for _ in range(ridge_max_iters):
+    for attempt in range(ridge_max_iters):
         try:
             R = torch.linalg.cholesky(C + lam * diag_mean * eye, upper=True)
             return _Whitening(R=R, is_triangular=True)
         except Exception:  # noqa: BLE001 — torch raises various error subtypes
             lam *= 10
+            if attempt >= 1:
+                logger.warning(
+                    "Cholesky failed at attempt %d; escalating ridge to λ=%.3e (d=%d)",
+                    attempt + 1, lam, d,
+                )
 
+    logger.warning(
+        "Cholesky failed after %d ridge retries (final λ=%.3e, d=%d); "
+        "falling back to eigendecomposition",
+        ridge_max_iters, lam, d,
+    )
     # Persistent failure: eigendecomp + clamp eigvals at 1e-8.
     # R = sqrt(Λ) Vᵀ satisfies Rᵀ R = V Λ Vᵀ = C.
     eigvals, eigvecs = torch.linalg.eigh(C)

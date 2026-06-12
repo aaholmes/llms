@@ -10,6 +10,8 @@ Verifies:
 
 from __future__ import annotations
 
+import logging
+
 import pytest
 import torch
 
@@ -126,6 +128,26 @@ def test_invalid_rank_raises():
         activation_aware_factor(W, C, rank=0)
     with pytest.raises(ValueError):
         activation_aware_factor(W, C, rank=9)
+
+
+def test_rank_exceeding_min_dim_raises():
+    W = torch.randn(12, 6, dtype=torch.float64)
+    C = torch.eye(6, dtype=torch.float64)
+    with pytest.raises(ValueError):
+        activation_aware_factor(W, C, rank=7)
+
+
+def test_eigendecomp_fallback_warns(caplog):
+    """Indefinite C defeats the ridge (negative diag mean) → eigendecomp fallback + warning."""
+    d = 8
+    C = -torch.eye(d, dtype=torch.float64)
+    W = torch.randn(d, d, dtype=torch.float64)
+
+    with caplog.at_level(logging.WARNING, logger="mla.svd"):
+        A, B = activation_aware_factor(W, C, rank=4)
+
+    assert torch.isfinite(A).all() and torch.isfinite(B).all()
+    assert any("eigendecomposition" in rec.getMessage() for rec in caplog.records)
 
 
 def test_discarded_energy_full_rank_is_zero():
