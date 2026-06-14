@@ -19,6 +19,10 @@
 set -euo pipefail
 cd "$(dirname "$0")/../.."
 
+# Reduce caching-allocator fragmentation — the 4B model leaves little headroom
+# on a 16 GB card, so fragmented free space can spuriously OOM mid-run.
+export PYTORCH_CUDA_ALLOC_CONF="${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}"
+
 ARTIFACT=${ARTIFACT:-experiments/stage_b/r256_drope32.pt}
 OUT=${OUT:-experiments/stage_b/heal_r256_drope32}
 MAX_HOURS=${MAX_HOURS:-9}

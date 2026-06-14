@@ -461,8 +461,16 @@ def main(argv: list[str] | None = None) -> int:
           f"d_rope={artifact['meta']['d_rope']}", flush=True)
 
     print(f"[heal] loading base weights {model_id}", flush=True)
-    loaded = load_weights(model_id, dtype=dtype, device=args.device)
+    # Stage the HF weights on CPU and move only the constructed model to the
+    # device. Loading straight to cuda keeps the 8 GB staging state dict
+    # resident alongside the model's own 8 GB copy — two full models on a
+    # 16 GB card OOMs before training starts. Free the staging copy once the
+    # model owns its weights.
+    loaded = load_weights(model_id, dtype=dtype, device="cpu")
     model = Qwen3Model.from_loaded(loaded).to(dtype=dtype, device=args.device)
+    del loaded
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
 
     print("[heal] applying MLA swap", flush=True)
     apply_mla(model, artifact)
