@@ -364,6 +364,30 @@ def test_train_loop_runs_synthetic(tmp_path: Path) -> None:
     assert len(lines) == 10
 
 
+def test_train_loop_max_seconds_stops_early(tmp_path: Path) -> None:
+    """A zero time budget stops at the first step boundary with a final val."""
+    c = Cfg()
+    model, inventory = _build_tiny_trainable(c, d_rope=8)
+    optim = build_optimizer(inventory, lr_mla=1e-2, lr_lora=1e-2)
+
+    torch.manual_seed(0)
+    train_chunks = [torch.randint(0, c.vocab_size, (1, 8), dtype=torch.long) for _ in range(4)]
+    val_chunks = [torch.randint(0, c.vocab_size, (1, 8), dtype=torch.long) for _ in range(2)]
+
+    out_dir = tmp_path / "heal_budget"
+    summary = train_loop(
+        model, optim, inventory, train_chunks, val_chunks,
+        steps=1000, grad_accum=1, seq_len=8,
+        warmup_frac=0.1, val_every=500, log_every=1000,
+        out_dir=out_dir, max_seconds=0.0,
+    )
+    assert summary["stopped_early"] is True
+    assert summary["best_val_ppl"] < float("inf")  # final val ran before stopping
+    with (out_dir / "training_log.jsonl").open() as f:
+        lines = [line for line in f if line.strip()]
+    assert len(lines) < 1000
+
+
 # --- Real-model CUDA smoke ------------------------------------------------
 
 

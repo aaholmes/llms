@@ -277,9 +277,15 @@ def train_loop(
     out_dir: Path,
     grad_clip: float = 1.0,
     seed: int = 0,
+    max_seconds: float | None = None,
     progress_writer=None,
 ) -> dict:
-    """Train ``model`` for ``steps`` optimizer steps. Returns final summary dict."""
+    """Train ``model`` for ``steps`` optimizer steps. Returns final summary dict.
+
+    If ``max_seconds`` is set, training stops cleanly at the first step
+    boundary past the budget (a final validation runs before stopping), so
+    the cosine schedule should be sized via ``steps`` to roughly match.
+    """
     device = next(model.parameters()).device
     log_path = out_dir / "training_log.jsonl"
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -288,10 +294,12 @@ def train_loop(
 
     best_val_ppl = float("inf")
     best_step = -1
+    stopped_early = False
     t0 = time.time()
 
     with log_path.open("w") as log_f:
         for step in range(steps):
+            out_of_time = max_seconds is not None and time.time() - t0 > max_seconds
             mult = cosine_warmup_multiplier(step, steps, warmup_frac)
             apply_lr_multiplier(optim, mult)
 
@@ -323,7 +331,7 @@ def train_loop(
                 "wall_seconds": time.time() - t0,
             }
 
-            do_val = (step + 1) % val_every == 0 or step == steps - 1
+            do_val = (step + 1) % val_every == 0 or step == steps - 1 or out_of_time
             if do_val:
                 model.eval()
                 val = evaluate_ppl(model, val_chunks)
@@ -347,9 +355,18 @@ def train_loop(
                     msg += f" val_ppl={entry['val_ppl']:.4f}"
                 progress_writer(msg)
 
+            if out_of_time:
+                stopped_early = True
+                if progress_writer is not None:
+                    progress_writer(
+                        f"[heal] time budget reached after step {step+1}/{steps}; stopping"
+                    )
+                break
+
     return {
         "best_val_ppl": best_val_ppl,
         "best_step": best_step,
+        "stopped_early": stopped_early,
         "wall_seconds": time.time() - t0,
         "n_trainable_total": inventory.n_total,
         "n_trainable_mla_proj": inventory.n_mla_proj,
@@ -393,6 +410,12 @@ def main(argv: list[str] | None = None) -> int:
     )
     ap.add_argument("--split-seed", type=int, default=17, help="train-split sampling seed")
     ap.add_argument("--steps", type=int, default=3000, help="optimizer steps")
+    ap.add_argument(
+        "--max-hours", type=float, default=None,
+        help="wall-clock budget; stop cleanly (with a final val) at the first "
+             "step boundary past it. Size --steps to roughly match so the "
+             "cosine schedule isn't cut off mid-decay.",
+    )
     ap.add_argument("--seq-len", type=int, default=1024)
     ap.add_argument("--micro-batch", type=int, default=1, help="(unused for now — micro_batch=1)")
     ap.add_argument("--grad-accum", type=int, default=32)
@@ -502,6 +525,7 @@ def main(argv: list[str] | None = None) -> int:
         out_dir=out_dir,
         grad_clip=args.grad_clip,
         seed=args.split_seed,
+        max_seconds=args.max_hours * 3600.0 if args.max_hours is not None else None,
         progress_writer=lambda m: print(m, flush=True),
     )
 
