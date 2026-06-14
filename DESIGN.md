@@ -136,7 +136,7 @@ Output:
 **Stage C success criteria:**
 - Phase diagram across (target compression × draft compression × K) showing where compression is complementary to spec decode vs where it costs more in acceptance than it gains in verification speed.
 - A clear answer on whether coupled distortion (R3) preserves acceptance materially better than target-only (R2). Either sign is publishable; null result is publishable too.
-- One headline number for the resume / interview pitch (e.g., "4× KV compression on both target and draft preserves 95% of baseline acceptance rate while extending usable context from X to Y at fixed 16 GB VRAM").
+- One headline number for the abstract / writeup (e.g., "4× KV compression on both target and draft preserves 95% of baseline acceptance rate while extending usable context from X to Y at fixed 16 GB VRAM").
 
 ---
 

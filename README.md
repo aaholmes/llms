@@ -95,7 +95,7 @@ The fix dramatically improves moderate-rank points (r256, r192, r128_drope64) an
 - **Aggressive (4× compression, +826 % PPL)**: `r256_drope32`. Quality is bad enough that this is only useful in the speculative-decoding setting where the target is unchanged and the MLA-converted draft just needs to *agree often enough* with the target — a question Stage C explicitly studies.
 - **Conservative (1.33–1.45× compression, +25–38 % PPL)**: V-only at rank 384–512. Smaller compression but the quality cost is bounded, and this is the "no-FT, deployment-safe" zone.
 
-Raw artifacts: `experiments/stage_b/eval_summary_partial_rope_v2.md` (the fixed sweep), `eval_summary_partial_rope_v1_BROKEN.md` (the original broken-RoPE results, kept for the historical record), `eval_summary_v_only.md`. Per-config converted checkpoints under `experiments/stage_b/r*.pt` (gitignored).
+Raw artifacts: `experiments/stage_b/eval_summary_partial_rope_v2.md` (the fixed sweep), `eval_summary_partial_rope_v1_superseded.md` (the original broken-RoPE results, kept for the historical record), `eval_summary_v_only.md`. Per-config converted checkpoints under `experiments/stage_b/r*.pt` (gitignored).
 
 ## Engine speedups (Stage A end-to-end)
 
