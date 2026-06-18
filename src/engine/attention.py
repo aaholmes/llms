@@ -98,6 +98,11 @@ class Attention(nn.Module):
         self.o = nn.Linear(num_heads * head_dim, hidden_size, bias=False)
         self.q_norm = RMSNorm(head_dim, eps=rms_eps)
         self.k_norm = RMSNorm(head_dim, eps=rms_eps)
+        # Optional swappable decode attention op (strategy hook). When set, it
+        # replaces the single-query (T==1) attention computation; default None
+        # leaves the SDPA path byte-for-byte unchanged. The callback receives the
+        # pre-GQA-expansion K/V and returns attn of shape (B, num_heads, 1, head_dim).
+        self.decode_attn_op = None
 
     def forward(
         self,
@@ -129,6 +134,15 @@ class Attention(nn.Module):
         kv_cache.v[layer_idx][:B, :, start_pos:end_pos, :] = v
         full_k = kv_cache.k[layer_idx][:B, :, :end_pos, :]
         full_v = kv_cache.v[layer_idx][:B, :, :end_pos, :]
+
+        # Swappable decode op: replaces SDPA for the single-query path, fed the
+        # pre-expansion (GQA) K/V so it can group/sample as it sees fit.
+        if T == 1 and self.decode_attn_op is not None:
+            attn = self.decode_attn_op(
+                q, full_k, full_v, scale=self.head_dim ** -0.5, layer_idx=layer_idx
+            )
+            attn = attn.transpose(1, 2).reshape(B, T, self.num_heads * self.head_dim)
+            return self.o(attn)
 
         n_rep = self.num_heads // self.num_kv_heads
         if n_rep > 1:
