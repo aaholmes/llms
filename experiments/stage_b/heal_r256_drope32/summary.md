@@ -1,0 +1,32 @@
+# Healing finetune summary
+
+- **mla_artifact**: experiments/stage_b/r256_drope32.pt
+- **out**: experiments/stage_b/heal_r256_drope32
+- **data**: wt103
+- **split_seed**: 17
+- **steps**: 400
+- **max_hours**: 9.0
+- **seq_len**: 1024
+- **micro_batch**: 1
+- **grad_accum**: 32
+- **lora_rank**: 16
+- **lora_alpha**: 32.0
+- **lr_mla**: 5e-05
+- **lr_lora**: 0.0001
+- **warmup_frac**: 0.03
+- **grad_clip**: 1.0
+- **val_every**: 30
+- **val_chunks**: 50
+- **train_chunks**: 20000
+- **log_every**: 10
+- **device**: cuda
+- **dtype**: bfloat16
+- **no_grad_ckpt**: False
+- **pre_ft_val_ppl**: 201.01202392578125
+- **best_val_ppl**: 13.452256202697754
+- **best_step**: 389
+- **stopped_early**: False
+- **wall_seconds**: 11890.25068950653
+- **n_trainable_total**: 92602368
+- **n_trainable_mla_proj**: 63700992
+- **n_trainable_lora**: 28901376
