@@ -1,5 +1,6 @@
 MOTIVATION.md
 CLAUDE.md
+*.local.md
 
 .venv/
 __pycache__/

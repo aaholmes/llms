@@ -32,7 +32,11 @@ from pathlib import Path
 import torch
 
 from engine.weights import LoadedModel, load_weights
-from mla.svd import activation_aware_factor, discarded_singular_energy
+from mla.svd import (
+    activation_aware_factor,
+    discarded_singular_energy,
+    weighted_singular_values,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -65,6 +69,125 @@ def _expand_row_perm(perm: list[int], num_heads: int, head_dim: int) -> list[int
     return [h * head_dim + perm[i] for h in range(num_heads) for i in range(head_dim)]
 
 
+def _rope_perms(head_dim: int, num_heads: int, num_kv_heads: int, d_rope: int) -> dict:
+    """Per-head + per-row permutation/index sets shared by spectrum and factor passes.
+
+    Factored out so the activation-weighted spectrum used for adaptive-rank
+    allocation is built from *exactly* the same stacked ``[K_nope; V]`` rows
+    that the factorization later decomposes — they must not diverge.
+    """
+    d_nope = head_dim - d_rope
+    head_perm = per_head_rope_pair_perm(head_dim, d_rope)
+    return {
+        "d_nope": d_nope,
+        "head_perm": head_perm,
+        "k_row_perm": _expand_row_perm(head_perm, num_kv_heads, head_dim),
+        "q_row_perm": _expand_row_perm(head_perm, num_heads, head_dim),
+        "nope_rows": [h * head_dim + i for h in range(num_kv_heads) for i in range(d_nope)],
+        "rope_rows": [
+            h * head_dim + d_nope + j for h in range(num_kv_heads) for j in range(d_rope)
+        ],
+    }
+
+
+def _w_stack_for_layer(loaded: LoadedModel, i: int, perms: dict, d_rope: int):
+    """Build the stacked ``[K_nope; V]`` weight (and the K-nope/rope/V pieces) for layer ``i``."""
+    prefix = f"layers.{i}.attn."
+    W_K_perm = loaded.state[prefix + "k.weight"][perms["k_row_perm"], :]
+    W_V = loaded.state[prefix + "v.weight"]  # *not* permuted
+    d_nope = perms["d_nope"]
+    if d_nope > 0 and d_rope > 0:
+        W_K_nope = W_K_perm[perms["nope_rows"]]
+        W_kr = W_K_perm[perms["rope_rows"]]
+    elif d_nope > 0:  # d_rope == 0
+        W_K_nope = W_K_perm
+        W_kr = None
+    else:  # d_nope == 0, d_rope == head_dim
+        W_K_nope = None
+        W_kr = W_K_perm
+    W_stack = torch.cat([W_K_nope, W_V], dim=0) if W_K_nope is not None else W_V
+    return W_stack, W_K_nope, W_kr, W_V
+
+
+def allocate_adaptive_ranks(
+    spectra: list[torch.Tensor],
+    total_budget: int,
+    *,
+    min_rank: int = 1,
+) -> list[int]:
+    """Allocate a total rank budget across layers to minimize total discarded energy.
+
+    Given each layer's C-weighted singular spectrum (descending), assigns
+    per-layer ranks ``r_i`` with ``Σ r_i = total_budget`` that **maximize the
+    retained Σσ² across all layers** — equivalently minimize the total
+    activation-weighted reconstruction error. This is optimal by a pooling
+    argument: keep the globally largest ``total_budget`` squared singular
+    values; because each layer's spectrum is descending, the kept set is a
+    contiguous top-``r_i`` prefix per layer.
+
+    Every layer is floored at ``min_rank`` and capped at its spectrum length
+    (``min(W.shape)`` — full rank, zero discarded). Returns ``list[int]``.
+    """
+    n = len(spectra)
+    caps = [int(s.numel()) for s in spectra]
+    floor_total = min_rank * n
+    cap_total = sum(caps)
+    if total_budget < floor_total:
+        raise ValueError(
+            f"total_budget={total_budget} < min_rank*num_layers={floor_total}"
+        )
+    if any(min_rank > c for c in caps):
+        raise ValueError(f"min_rank={min_rank} exceeds a layer's full rank {min(caps)}")
+    if total_budget >= cap_total:
+        return list(caps)  # budget covers full rank everywhere
+
+    ranks = [min_rank] * n
+    remaining = total_budget - floor_total
+    # Claimable: each layer's singular values beyond the floored prefix, tagged
+    # by layer. Pick the largest `remaining` of them (greedy == optimal here).
+    claim: list[tuple[float, int]] = []
+    for li, s in enumerate(spectra):
+        sq = (s.to(torch.float64) ** 2)
+        for j in range(min_rank, caps[li]):
+            claim.append((float(sq[j]), li))
+    claim.sort(reverse=True)
+    for _, li in claim[:remaining]:
+        ranks[li] += 1
+    return ranks
+
+
+def compute_adaptive_ranks(
+    loaded: LoadedModel,
+    *,
+    covariances: list[torch.Tensor],
+    d_rope: int,
+    total_budget: int,
+    min_rank: int = 1,
+    ridge_lambda: float = 1e-6,
+    ridge_max_iters: int = 6,
+    progress: bool = False,
+) -> list[int]:
+    """Per-layer ranks from a total budget, via activation-weighted spectra.
+
+    Runs one whitened-SVD spectrum pass per layer (same ridge schedule as the
+    factorization) and water-fills ``total_budget`` across them. Convenience
+    wrapper over :func:`allocate_adaptive_ranks`.
+    """
+    cfg = loaded.config
+    perms = _rope_perms(cfg.head_dim, cfg.num_attention_heads, cfg.num_key_value_heads, d_rope)
+    spectra: list[torch.Tensor] = []
+    for i in range(cfg.num_hidden_layers):
+        W_stack, *_ = _w_stack_for_layer(loaded, i, perms, d_rope)
+        s = weighted_singular_values(
+            W_stack, covariances[i],
+            ridge_lambda=ridge_lambda, ridge_max_iters=ridge_max_iters,
+        )
+        spectra.append(s)
+        if progress:
+            print(f"[convert]   spectrum {i+1}/{cfg.num_hidden_layers}", flush=True)
+    return allocate_adaptive_ranks(spectra, total_budget, min_rank=min_rank)
+
+
 def _git_rev() -> str:
     try:
         out = subprocess.check_output(
@@ -83,6 +206,7 @@ def convert_loaded_to_mla(
     covariances: list[torch.Tensor],
     rank: int,
     d_rope: int,
+    ranks: list[int] | None = None,
     factor_dtype: torch.dtype = torch.bfloat16,
     ridge_lambda: float = 1e-6,
     ridge_max_iters: int = 6,
@@ -101,8 +225,15 @@ def convert_loaded_to_mla(
         Order must match ``loaded.config.num_hidden_layers``.
     rank
         Target latent rank ``r``; ``W_dkv`` will be ``(r, hidden_size)``.
+        Used for every layer unless ``ranks`` is given. Also stored in meta
+        as the nominal/average rank for reporting.
     d_rope
         Per-head RoPE-subspace width. ``0 ≤ d_rope ≤ head_dim``.
+    ranks
+        Optional per-layer ranks (length ``num_layers``). When provided,
+        layer ``i`` is factored to ``ranks[i]`` and the artifact is a
+        per-layer adaptive-rank conversion; ``rank`` is then only metadata.
+        See :func:`compute_adaptive_ranks`.
     factor_dtype
         Output dtype for factor weights. ``apply_mla`` will cast to the
         target model's dtype regardless, so this controls the on-disk
@@ -126,6 +257,13 @@ def convert_loaded_to_mla(
         raise ValueError(f"rank must be in [1, {hidden_size}]; got rank={rank}")
     if not (0 <= d_rope <= head_dim):
         raise ValueError(f"d_rope must be in [0, {head_dim}]; got d_rope={d_rope}")
+    if ranks is not None:
+        if len(ranks) != num_layers:
+            raise ValueError(
+                f"got {len(ranks)} per-layer ranks for a {num_layers}-layer model"
+            )
+        if any(not (1 <= r <= hidden_size) for r in ranks):
+            raise ValueError(f"every per-layer rank must be in [1, {hidden_size}]")
     if len(covariances) != num_layers:
         raise ValueError(
             f"got {len(covariances)} covariance matrices for a {num_layers}-layer model"
@@ -158,18 +296,12 @@ def convert_loaded_to_mla(
     # o_proj keep their original ordering — V isn't RoPE'd, and the
     # attention output (softmax(Q·Kᵀ)·V) is in V's ordering, so o_proj
     # consumes it unchanged.
-    head_perm = per_head_rope_pair_perm(head_dim, d_rope)
-    k_row_perm = _expand_row_perm(head_perm, num_kv_heads, head_dim)
-    q_row_perm = _expand_row_perm(head_perm, num_heads, head_dim)
     # After permutation, the first d_nope rows per head are nope, last
     # d_rope rows per head are rope — so the existing contiguous slicing
-    # is correct *on the permuted matrix*.
-    nope_rows_in_perm = [
-        h * head_dim + i for h in range(num_kv_heads) for i in range(d_nope)
-    ]
-    rope_rows_in_perm = [
-        h * head_dim + d_nope + j for h in range(num_kv_heads) for j in range(d_rope)
-    ]
+    # is correct *on the permuted matrix*. Shared with the spectrum pass.
+    perms = _rope_perms(head_dim, num_heads, num_kv_heads, d_rope)
+    q_row_perm = perms["q_row_perm"]
+    head_perm = perms["head_perm"]
 
     out_state: dict[str, torch.Tensor] = {}
     diagnostics: list[dict] = []
@@ -177,37 +309,24 @@ def convert_loaded_to_mla(
     t0_total = time.time()
     for i in range(num_layers):
         prefix = f"layers.{i}.attn."
-        W_K_perm = loaded.state[prefix + "k.weight"][k_row_perm, :]
-        W_V = loaded.state[prefix + "v.weight"]  # *not* permuted
+        layer_rank = ranks[i] if ranks is not None else rank
         C = covariances[i]
         if C.shape != (hidden_size, hidden_size):
             raise ValueError(
                 f"layer {i}: covariance shape {tuple(C.shape)} != ({hidden_size}, {hidden_size})"
             )
 
-        if d_nope > 0 and d_rope > 0:
-            W_K_nope = W_K_perm[nope_rows_in_perm]
-            W_kr = W_K_perm[rope_rows_in_perm]
-        elif d_nope > 0:  # d_rope == 0
-            W_K_nope = W_K_perm
-            W_kr = None
-        else:  # d_nope == 0, d_rope == head_dim
-            W_K_nope = None
-            W_kr = W_K_perm
+        # Stacked nope-K + V rows (shared construction with the spectrum pass).
+        W_stack, W_K_nope, W_kr, W_V = _w_stack_for_layer(loaded, i, perms, d_rope)
 
-        # Joint SVD over the stacked nope-K + V rows so they share W_dkv.
-        if W_K_nope is not None:
-            W_stack = torch.cat([W_K_nope, W_V], dim=0)
-        else:
-            W_stack = W_V
-
+        # Joint SVD over the stack so K-nope and V share W_dkv.
         A, B = activation_aware_factor(
-            W_stack, C, rank=rank,
+            W_stack, C, rank=layer_rank,
             ridge_lambda=ridge_lambda, ridge_max_iters=ridge_max_iters,
         )
         # Diagnostic: how much C-weighted error is being thrown away?
         discarded = discarded_singular_energy(
-            W_stack, C, rank=rank,
+            W_stack, C, rank=layer_rank,
             ridge_lambda=ridge_lambda, ridge_max_iters=ridge_max_iters,
         ).item()
 
@@ -238,6 +357,7 @@ def convert_loaded_to_mla(
 
         diagnostics.append({
             "layer": i,
+            "rank": layer_rank,
             "discarded_energy": float(discarded),
             "ridge_lambda": ridge_lambda,
         })
@@ -248,9 +368,12 @@ def convert_loaded_to_mla(
 
     wall_seconds = time.time() - t0_total
 
+    per_layer_ranks = list(ranks) if ranks is not None else [rank] * num_layers
     meta: dict = {
         "model_id": target_model_id,
         "rank": rank,
+        "ranks": per_layer_ranks,
+        "adaptive_rank": ranks is not None,
         "d_rope": d_rope,
         "num_layers": num_layers,
         "hidden_size": hidden_size,
@@ -295,8 +418,21 @@ def _default_out_path(model_id: str, rank: int, d_rope: int) -> Path:
 def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(description=__doc__.split("\n", 1)[0])
     ap.add_argument("model_id", help="HF model id, e.g. Qwen/Qwen3-4B")
-    ap.add_argument("--rank", type=int, required=True, help="target latent rank")
+    ap.add_argument(
+        "--rank", type=int, required=True,
+        help="target latent rank. With --adaptive-rank this is the per-layer "
+             "*average* (total budget = rank × num_layers).",
+    )
     ap.add_argument("--d-rope", type=int, required=True, help="per-head RoPE-subspace width")
+    ap.add_argument(
+        "--adaptive-rank", action="store_true",
+        help="allocate the rank budget per layer by activation-weighted singular "
+             "spectra instead of a uniform rank (same total cache size).",
+    )
+    ap.add_argument(
+        "--min-rank", type=int, default=8,
+        help="floor on per-layer rank under --adaptive-rank",
+    )
     ap.add_argument(
         "--calib", required=True,
         help="calibration artifact (.pt). Shorthand like 'wt103-1k' resolves "
@@ -315,7 +451,12 @@ def main(argv: list[str] | None = None) -> int:
     args = ap.parse_args(argv)
 
     factor_dtype = getattr(torch, args.dtype)
-    out_path = Path(args.out) if args.out else _default_out_path(args.model_id, args.rank, args.d_rope)
+    if args.out:
+        out_path = Path(args.out)
+    else:
+        out_path = _default_out_path(args.model_id, args.rank, args.d_rope)
+        if args.adaptive_rank:
+            out_path = out_path.with_name(out_path.stem + "_adaptive.pt")
     out_path.parent.mkdir(parents=True, exist_ok=True)
 
     print(f"[convert] loading {args.model_id}", flush=True)
@@ -337,13 +478,27 @@ def main(argv: list[str] | None = None) -> int:
           f"token_count={calib_meta_in.get('token_count', '?')}",
           flush=True)
 
-    print(f"[convert] running per-layer joint SVD (rank={args.rank}, d_rope={args.d_rope})",
-          flush=True)
+    ranks = None
+    if args.adaptive_rank:
+        budget = args.rank * loaded.config.num_hidden_layers
+        print(f"[convert] computing adaptive ranks (budget={budget} = {args.rank}×"
+              f"{loaded.config.num_hidden_layers} layers, min_rank={args.min_rank})", flush=True)
+        ranks = compute_adaptive_ranks(
+            loaded, covariances=covariances, d_rope=args.d_rope,
+            total_budget=budget, min_rank=args.min_rank,
+            ridge_lambda=args.ridge_lambda, progress=True,
+        )
+        print(f"[convert]   ranks: min={min(ranks)} max={max(ranks)} "
+              f"mean={sum(ranks)/len(ranks):.1f}", flush=True)
+
+    print(f"[convert] running per-layer joint SVD (rank={args.rank}, d_rope={args.d_rope}, "
+          f"adaptive={args.adaptive_rank})", flush=True)
     artifact = convert_loaded_to_mla(
         loaded,
         covariances=covariances,
         rank=args.rank,
         d_rope=args.d_rope,
+        ranks=ranks,
         factor_dtype=factor_dtype,
         ridge_lambda=args.ridge_lambda,
         calibration_meta=calib_meta_in,

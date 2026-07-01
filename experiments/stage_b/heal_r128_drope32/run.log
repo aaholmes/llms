@@ -1,0 +1,57 @@
+[heal] loading artifact experiments/stage_b/r128_drope32.pt
+[heal]   model_id=Qwen/Qwen3-4B rank=128 d_rope=32
+[heal] loading base weights Qwen/Qwen3-4B
+Fetching 9 files:   0%|          | 0/9 [00:00<?, ?it/s]Fetching 9 files: 100%|██████████| 9/9 [00:00<00:00, 206277.25it/s]
+[heal] applying MLA swap
+[heal] wrapping LoRA (rank=16, alpha=32.0)
+[heal]   wrapped 180 Linear layers
+[heal] gradient checkpointing enabled
+[heal] trainable: 72.55M params (mla_proj=43.65M, lora=28.90M)
+[heal] loading 20000 train chunks (seq_len=1024)
+Warning: You are sending unauthenticated requests to the HF Hub. Please set a HF_TOKEN to enable higher rate limits and faster downloads.
+[heal]   got 20000 chunks
+[heal] loading 50 validation chunks
+[heal]   got 50 chunks
+[heal] measuring pre-FT validation PPL
+[heal]   pre-FT val_ppl=2281.0049
+[heal] step 10/400 loss=5.0517 grad_norm=13.00
+[heal] step 20/400 loss=3.8235 grad_norm=8.31
+[heal] step 30/400 loss=3.4276 grad_norm=3.36 val_ppl=27.6724
+[heal] step 40/400 loss=3.1780 grad_norm=3.16
+[heal] step 50/400 loss=3.0734 grad_norm=2.53
+[heal] step 60/400 loss=2.9990 grad_norm=2.69 val_ppl=20.2785
+[heal] step 70/400 loss=2.9370 grad_norm=2.48
+[heal] step 80/400 loss=2.9781 grad_norm=2.23
+[heal] step 90/400 loss=2.9343 grad_norm=2.19 val_ppl=18.4612
+[heal] step 100/400 loss=2.9195 grad_norm=2.23
+[heal] step 110/400 loss=2.8254 grad_norm=2.53
+[heal] step 120/400 loss=2.8295 grad_norm=2.17 val_ppl=17.6748
+[heal] step 130/400 loss=2.8543 grad_norm=2.00
+[heal] step 140/400 loss=2.8303 grad_norm=1.90
+[heal] step 150/400 loss=2.8129 grad_norm=2.05 val_ppl=17.2338
+[heal] step 160/400 loss=2.9126 grad_norm=2.31
+[heal] step 170/400 loss=2.7806 grad_norm=2.30
+[heal] step 180/400 loss=2.8110 grad_norm=2.36 val_ppl=16.9114
+[heal] step 190/400 loss=2.7391 grad_norm=1.76
+[heal] step 200/400 loss=2.7444 grad_norm=2.41
+[heal] step 210/400 loss=2.7502 grad_norm=3.59 val_ppl=16.7213
+[heal] step 220/400 loss=2.7722 grad_norm=2.48
+[heal] step 230/400 loss=2.7189 grad_norm=2.34
+[heal] step 240/400 loss=2.7357 grad_norm=2.23 val_ppl=16.5746
+[heal] step 250/400 loss=2.7561 grad_norm=1.95
+[heal] step 260/400 loss=2.7745 grad_norm=2.03
+[heal] step 270/400 loss=2.7188 grad_norm=2.08 val_ppl=16.4541
+[heal] step 280/400 loss=2.7861 grad_norm=1.80
+[heal] step 290/400 loss=2.7726 grad_norm=1.81
+[heal] step 300/400 loss=2.7168 grad_norm=1.80 val_ppl=16.4012
+[heal] step 310/400 loss=2.7671 grad_norm=2.00
+[heal] step 320/400 loss=2.7270 grad_norm=1.82
+[heal] step 330/400 loss=2.7551 grad_norm=1.78 val_ppl=16.3664
+[heal] step 340/400 loss=2.7607 grad_norm=1.84
+[heal] step 350/400 loss=2.8202 grad_norm=2.17
+[heal] step 360/400 loss=2.7701 grad_norm=1.87 val_ppl=16.3624
+[heal] step 370/400 loss=2.7164 grad_norm=1.73
+[heal] step 380/400 loss=2.7381 grad_norm=1.80
+[heal] step 390/400 loss=2.7822 grad_norm=1.82 val_ppl=16.3598
+[heal] step 400/400 loss=2.7187 grad_norm=2.03 val_ppl=16.3597
+[heal] done. best_val_ppl=16.3597 at step 399; wrote experiments/stage_b/heal_r128_drope32

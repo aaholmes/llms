@@ -2,7 +2,7 @@
 
 [![tests](https://github.com/aaholmes/llms/actions/workflows/tests.yml/badge.svg)](https://github.com/aaholmes/llms/actions/workflows/tests.yml)
 
-> **Status — v0.1.** Stage A (engine) and Stage A.5 (Triton kernels) are complete and tested. Stage B (post-hoc MHA→MLA conversion of Qwen3-4B) has the full pipeline shipped end-to-end, including a **LoRA + MLA-projection healing finetune**. The headline: a **4× KV-cache reduction for ~+16 % perplexity** after healing, measured against a same-budget finetuned control (so the figure isolates compression cost from domain adaptation). Without healing the same 4× point is unusable (+826 % PPL); healing closes essentially all of that gap. More operating points and a fair-FT sweep are **ongoing** — see [Stage B perplexity results](#stage-b-perplexity-results). Stage C (joint compression × spec-decode sweep at fixed VRAM): pending.
+> **Status — v0.1.** Stage A (engine) and Stage A.5 (Triton kernels) are complete and tested. Stage B (post-hoc MHA→MLA conversion of Qwen3-4B) has the full pipeline shipped end-to-end, including a **LoRA + MLA-projection healing finetune**. The headline: a **4× KV-cache reduction for ~+16 % perplexity** after healing, measured against a same-budget finetuned control (so the figure isolates compression cost from domain adaptation). Without healing the same 4× point is unusable (+826 % PPL); healing closes essentially all of that gap. The full compression–quality frontier (1.33× at +0.5 % up to 5.33× at +41 %) and a negative result on naive per-layer adaptive rank are in the [perplexity results](#stage-b-perplexity-results). Stage C (joint compression × spec-decode sweep at fixed VRAM): pending.
 
 ## At a glance
 
@@ -103,7 +103,30 @@ Evaluated on the **same** 250-chunk validation slice as the sweep above:
 
 The healed 4×-compressed model *beats* the raw baseline by 40 % — but that headline is **mostly WikiText-103 domain adaptation, not compression recovery**: a same-budget finetune of the *uncompressed* model (the control) reaches 11.13 on its own. The honest marginal cost of 4× KV compression, after healing, is **+16.0 % PPL** vs that control — modest and bounded, against a +826 % no-FT cliff. Running the control instead of comparing to the un-finetuned baseline is the difference between an honest number and a flattering one.
 
-**Ongoing.** Healing the remaining operating points (lower-rank partial-RoPE, V-only) to map the post-heal compression–quality frontier, and a matched control per point. Two no-FT zones remain usable today without any finetune: the V-only **1.33–1.45× at +25–38 % PPL** "deployment-safe" zone, and the aggressive 4× point for the speculative-decoding setting Stage C studies, where the MLA draft only needs to *agree often enough* with an unchanged target.
+**The post-heal frontier.** Healing every operating point (each with the same recipe; the uncompressed FT control is amortized across all of them, since it doesn't depend on rank) traces the compression–quality curve:
+
+![Post-heal perplexity vs KV compression](experiments/stage_b/frontier_plot.png)
+
+| Config | Compression | PPL | Δ% vs baseline | Δ% vs FT control |
+|---|---:|---:|---:|---:|
+| `r512_drope128` (V-only) | 1.33× | 11.19 | −48.3 % | **+0.5 %** |
+| **`r256_drope32`** (uniform) | 4.00× | 12.91 | −40.3 % | **+16.0 %** |
+| `r192_drope32` | 4.57× | 13.81 | −36.2 % | +24.0 % |
+| `r128_drope32` | 5.33× | 15.65 | −27.7 % | +40.6 % |
+
+The curve is monotonic and the low end is nearly free: **1.33× compression costs +0.5 % PPL** vs the control — a deployment-safe point — rising to +16 % at 4× and +41 % at 5.33×.
+
+**A negative result worth keeping: naive per-layer adaptive rank is *worse* than uniform.** It's tempting to allocate the rank budget per layer by each layer's activation-weighted singular spectrum (keep the globally-largest singular values — provably optimal for *reconstruction error* at a fixed budget). Doing so is **much worse**:
+
+| 4× allocation | early-layer rank | PPL | Δ% vs FT control |
+|---|---|---:|---:|
+| uniform | 256 | 12.91 | **+16.0 %** |
+| adaptive, `min_rank=8` | 8 | 22.01 | +97.8 % |
+| adaptive, `min_rank=128` | 128 | 14.29 | +28.3 % |
+
+The spectrum-optimal allocation floors the early layers (their K/V spectra decay fast, so they *look* cheap to compress) and lands at +97.8 %. Protecting the early layers (`min_rank=128`) recovers most of it (+28.3 %) — confirming the cause is **early-layer starvation** — but it *still* trails uniform, and in fact sits strictly inside the uniform frontier (uniform at 4.57× beats adaptive at 4.0×). The lesson: **per-layer reconstruction error is the wrong objective**, because it can't see that an early layer's error propagates and amplifies through every downstream layer. A correct adaptive scheme needs end-to-end sensitivity (gradient/Hessian/ablation), not local spectra — uniform's accidental early-layer generosity is closer to right.
+
+Raw artifacts: `experiments/stage_b/eval_summary_frontier.{md,json}` (the full frontier), `frontier_plot.png`, per-point `heal_*/` and `control_ft/` training logs, and the eval drivers `eval_frontier.py` / `plot_frontier.py`.
 
 Raw artifacts: `experiments/stage_b/eval_summary_healed.{md,json}` (healed vs baseline), `heal_r256_drope32/` and `control_ft/` (training logs + best checkpoints), `eval_summary_partial_rope_v2.md` (the fixed no-FT sweep), `eval_summary_partial_rope_v1_superseded.md` (original broken-RoPE results, kept for the record), `eval_summary_v_only.md`. Per-config converted checkpoints under `experiments/stage_b/r*.pt` (gitignored).
 

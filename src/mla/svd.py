@@ -135,6 +135,28 @@ def activation_aware_factor(
     return A, B
 
 
+def weighted_singular_values(
+    W: torch.Tensor,
+    C: torch.Tensor,
+    *,
+    ridge_lambda: float = 1e-6,
+    ridge_max_iters: int = 6,
+) -> torch.Tensor:
+    """Singular values σ_i of the whitened weight ``M = W Rᵀ`` (fp64, descending).
+
+    These are the C-weighted singular values: truncating the activation-aware
+    factorization to rank ``r`` discards exactly ``Σ_{i>r} σ_i²`` of error in
+    the C-weighted norm. Returned descending, length ``min(W.shape)``. Used by
+    :func:`discarded_singular_energy` and by cross-layer adaptive-rank
+    allocation, which pools these spectra across layers.
+    """
+    W64 = W.to(torch.float64)
+    C64 = C.to(torch.float64)
+    R = _ridge_cholesky(C64, ridge_lambda, ridge_max_iters).R
+    M = W64 @ R.T
+    return torch.linalg.svdvals(M)
+
+
 def discarded_singular_energy(
     W: torch.Tensor,
     C: torch.Tensor,
@@ -149,13 +171,9 @@ def discarded_singular_energy(
     bound is comparable to its empirical residual. Useful for energy-threshold
     rank selection (compare against the cumulative singular-value energy).
     """
-    W64 = W.to(torch.float64)
-    C64 = C.to(torch.float64)
-
-    R = _ridge_cholesky(C64, ridge_lambda, ridge_max_iters).R
-    M = W64 @ R.T
-    S = torch.linalg.svdvals(M)
-
+    S = weighted_singular_values(
+        W, C, ridge_lambda=ridge_lambda, ridge_max_iters=ridge_max_iters
+    )
     if rank >= S.numel():
         return torch.zeros((), dtype=torch.float64, device=W.device)
     return (S[rank:] ** 2).sum()

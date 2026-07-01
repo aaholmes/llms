@@ -37,19 +37,22 @@ def apply_mla(model: Qwen3Model, artifact: dict) -> Qwen3Model:
     for i, block in enumerate(model.layers):
         if isinstance(block.attn, MLAttention):
             continue
+        prefix = f"layers.{i}.attn."
+        # Per-layer rank from the dkv weight shape — works for both uniform
+        # and adaptive-rank artifacts without trusting a global meta field.
+        layer_rank = state[prefix + "dkv.weight"].shape[0]
         mla = MLAttention(
             hidden_size=meta["hidden_size"],
             num_heads=meta["num_heads"],
             num_kv_heads=meta["num_kv_heads"],
             head_dim=meta["head_dim"],
             rms_eps=meta["rms_eps"],
-            rank=meta["rank"],
+            rank=layer_rank,
             d_rope=meta["d_rope"],
             max_position_embeddings=meta["max_position_embeddings"],
             rope_theta=meta["rope_theta"],
             qk_norm_mode=meta.get("qk_norm_mode", "single"),
         )
-        prefix = f"layers.{i}.attn."
         with torch.no_grad():
             mla.q.weight.copy_(state[prefix + "q.weight"])
             mla.dkv.weight.copy_(state[prefix + "dkv.weight"])
@@ -78,19 +81,20 @@ def alloc_mla_cache(
     device: torch.device | str | None = None,
 ) -> MLAKVCache:
     """Allocate an MLAKVCache shaped for a model that's already had MLAttention swapped in."""
-    first_attn: MLAttention = next(
-        m for m in model.modules() if isinstance(m, MLAttention)
-    )
+    attns: list[MLAttention] = [b.attn for b in model.layers if isinstance(b.attn, MLAttention)]
+    first_attn = attns[0]
     if dtype is None:
         dtype = next(model.parameters()).dtype
     if device is None:
         device = next(model.parameters()).device
+    # Per-layer ranks in layer order (uniform artifacts give a constant list).
+    ranks = [a.rank for a in attns]
     return MLAKVCache.alloc(
         num_layers=len(model.layers),
         max_batch=max_batch,
         num_kv_heads=first_attn.num_kv_heads,
         max_seq_len=max_seq_len,
-        rank=first_attn.rank,
+        rank=ranks,
         d_rope=first_attn.d_rope,
         dtype=dtype,
         device=device,

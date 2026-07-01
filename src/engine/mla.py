@@ -62,15 +62,23 @@ class MLAKVCache:
         max_batch: int,
         num_kv_heads: int,
         max_seq_len: int,
-        rank: int,
+        rank: int | list[int],
         d_rope: int,
         dtype: torch.dtype,
         device: torch.device | str,
     ) -> "MLAKVCache":
-        c_shape = (max_batch, max_seq_len, rank)
+        # ``rank`` may be a single width (uniform) or one width per layer
+        # (adaptive-rank conversion); each layer's c_kv is an independent
+        # tensor, so per-layer widths need no other plumbing.
+        ranks = rank if isinstance(rank, list) else [rank] * num_layers
+        if len(ranks) != num_layers:
+            raise ValueError(f"got {len(ranks)} per-layer ranks for {num_layers} layers")
         r_shape = (max_batch, max_seq_len, num_kv_heads, d_rope)
         return cls(
-            c_kv=[torch.empty(c_shape, dtype=dtype, device=device) for _ in range(num_layers)],
+            c_kv=[
+                torch.empty((max_batch, max_seq_len, r), dtype=dtype, device=device)
+                for r in ranks
+            ],
             k_rope_pre=[torch.empty(r_shape, dtype=dtype, device=device) for _ in range(num_layers)],
         )
 
