@@ -39,6 +39,26 @@ def test_allocate_is_optimal_favours_heavier_tail():
     assert ranks == [1, 3]
 
 
+def test_allocate_normalized_score_favours_early_layer():
+    # layer 0 = fast-decaying (small tail), layer 1 = flat (heavy tail).
+    # RAW pooling sends all extra budget to layer 1 (its σ² are larger).
+    # NORMALIZED (σ²/tail) rewards layer 0's sharp relative drop, so it no
+    # longer starves — the CARE fix for early-layer starvation.
+    spectra = [torch.tensor([10.0, 1.0, 0.1, 0.01]), torch.tensor([5.0, 4.0, 3.0, 2.0])]
+    raw = allocate_adaptive_ranks(spectra, total_budget=4, min_rank=1, score="raw")
+    norm = allocate_adaptive_ranks(spectra, total_budget=4, min_rank=1, score="normalized")
+    assert sum(norm) == 4 and all(r >= 1 for r in norm)
+    # normalized gives layer 0 at least as much as raw, and strictly more here.
+    assert norm[0] >= raw[0]
+    assert norm[0] > raw[0]
+
+
+def test_allocate_bad_score_raises():
+    spectra = [torch.randn(4).abs(), torch.randn(4).abs()]
+    with pytest.raises(ValueError):
+        allocate_adaptive_ranks(spectra, total_budget=4, min_rank=1, score="bogus")
+
+
 def test_allocate_full_budget_returns_caps():
     spectra = [torch.randn(4).abs(), torch.randn(6).abs()]
     ranks = allocate_adaptive_ranks(spectra, total_budget=10, min_rank=1)

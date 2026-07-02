@@ -114,20 +114,36 @@ def allocate_adaptive_ranks(
     total_budget: int,
     *,
     min_rank: int = 1,
+    score: str = "raw",
 ) -> list[int]:
-    """Allocate a total rank budget across layers to minimize total discarded energy.
+    """Allocate a total rank budget across layers by greedy marginal value.
 
     Given each layer's C-weighted singular spectrum (descending), assigns
-    per-layer ranks ``r_i`` with ``Σ r_i = total_budget`` that **maximize the
-    retained Σσ² across all layers** — equivalently minimize the total
-    activation-weighted reconstruction error. This is optimal by a pooling
-    argument: keep the globally largest ``total_budget`` squared singular
-    values; because each layer's spectrum is descending, the kept set is a
-    contiguous top-``r_i`` prefix per layer.
+    per-layer ranks ``r_i`` with ``Σ r_i = total_budget``. Greedy: repeatedly
+    give one rank to the layer with the largest marginal score for its *next*
+    singular value, until the budget is spent. The ``score`` selects the
+    marginal value:
+
+    - ``"raw"`` — marginal ``= σ²_{r+1}`` (the next squared singular value).
+      Equivalent to a static global top-``budget`` sort of pooled σ²; provably
+      maximizes retained Σσ² (minimizes total activation-weighted reconstruction
+      error). **But** because late layers have larger-scale spectra, this
+      starves early layers → empirically ≈6× worse PPL than uniform. See the
+      adaptive-rank negative result in DESIGN.md.
+    - ``"normalized"`` — marginal ``= σ²_{r+1} / Σ_{m>r} σ²_m`` (next value over
+      the layer's *remaining* tail energy at its current rank). This is CARE's
+      (arXiv:2603.17946) score: it makes layers of different spectral scale
+      comparable and prevents early-layer starvation. Path-dependent (the
+      denominator shrinks as a layer accrues rank), so it needs the true greedy
+      loop, not a static sort.
 
     Every layer is floored at ``min_rank`` and capped at its spectrum length
     (``min(W.shape)`` — full rank, zero discarded). Returns ``list[int]``.
     """
+    import heapq
+
+    if score not in ("raw", "normalized"):
+        raise ValueError(f"score must be 'raw' or 'normalized'; got {score!r}")
     n = len(spectra)
     caps = [int(s.numel()) for s in spectra]
     floor_total = min_rank * n
@@ -141,18 +157,28 @@ def allocate_adaptive_ranks(
     if total_budget >= cap_total:
         return list(caps)  # budget covers full rank everywhere
 
+    sq = [s.to(torch.float64) ** 2 for s in spectra]
     ranks = [min_rank] * n
     remaining = total_budget - floor_total
-    # Claimable: each layer's singular values beyond the floored prefix, tagged
-    # by layer. Pick the largest `remaining` of them (greedy == optimal here).
-    claim: list[tuple[float, int]] = []
-    for li, s in enumerate(spectra):
-        sq = (s.to(torch.float64) ** 2)
-        for j in range(min_rank, caps[li]):
-            claim.append((float(sq[j]), li))
-    claim.sort(reverse=True)
-    for _, li in claim[:remaining]:
+
+    def marginal(li: int, r: int) -> float:
+        """Score for giving layer ``li`` its (r+1)-th rank (0-indexed sv at r)."""
+        v = float(sq[li][r])
+        if score == "raw":
+            return v
+        tail = float(sq[li][r:].sum())  # Σ_{m≥r} σ²_m (remaining, incl. current)
+        return v / tail if tail > 0 else 0.0
+
+    # Max-heap (via negated score) keyed on each layer's next-rank marginal.
+    heap = [(-marginal(li, ranks[li]), li) for li in range(n) if ranks[li] < caps[li]]
+    heapq.heapify(heap)
+    for _ in range(remaining):
+        if not heap:
+            break
+        _, li = heapq.heappop(heap)
         ranks[li] += 1
+        if ranks[li] < caps[li]:
+            heapq.heappush(heap, (-marginal(li, ranks[li]), li))
     return ranks
 
 
@@ -163,6 +189,7 @@ def compute_adaptive_ranks(
     d_rope: int,
     total_budget: int,
     min_rank: int = 1,
+    score: str = "raw",
     ridge_lambda: float = 1e-6,
     ridge_max_iters: int = 6,
     progress: bool = False,
@@ -171,7 +198,8 @@ def compute_adaptive_ranks(
 
     Runs one whitened-SVD spectrum pass per layer (same ridge schedule as the
     factorization) and water-fills ``total_budget`` across them. Convenience
-    wrapper over :func:`allocate_adaptive_ranks`.
+    wrapper over :func:`allocate_adaptive_ranks`; ``score`` selects the greedy
+    marginal-value metric ('raw' or 'normalized').
     """
     cfg = loaded.config
     perms = _rope_perms(cfg.head_dim, cfg.num_attention_heads, cfg.num_key_value_heads, d_rope)
@@ -185,7 +213,7 @@ def compute_adaptive_ranks(
         spectra.append(s)
         if progress:
             print(f"[convert]   spectrum {i+1}/{cfg.num_hidden_layers}", flush=True)
-    return allocate_adaptive_ranks(spectra, total_budget, min_rank=min_rank)
+    return allocate_adaptive_ranks(spectra, total_budget, min_rank=min_rank, score=score)
 
 
 def _git_rev() -> str:
@@ -434,6 +462,11 @@ def main(argv: list[str] | None = None) -> int:
         help="floor on per-layer rank under --adaptive-rank",
     )
     ap.add_argument(
+        "--rank-score", default="raw", choices=["raw", "normalized"],
+        help="adaptive-rank marginal-value metric: 'raw' (σ², pooled) or "
+             "'normalized' (σ²/tail-energy, CARE-style; prevents early-layer starvation)",
+    )
+    ap.add_argument(
         "--calib", required=True,
         help="calibration artifact (.pt). Shorthand like 'wt103-1k' resolves "
              "to experiments/stage_b/calib/wt103_1k.pt.",
@@ -482,10 +515,11 @@ def main(argv: list[str] | None = None) -> int:
     if args.adaptive_rank:
         budget = args.rank * loaded.config.num_hidden_layers
         print(f"[convert] computing adaptive ranks (budget={budget} = {args.rank}×"
-              f"{loaded.config.num_hidden_layers} layers, min_rank={args.min_rank})", flush=True)
+              f"{loaded.config.num_hidden_layers} layers, min_rank={args.min_rank}, "
+              f"score={args.rank_score})", flush=True)
         ranks = compute_adaptive_ranks(
             loaded, covariances=covariances, d_rope=args.d_rope,
-            total_budget=budget, min_rank=args.min_rank,
+            total_budget=budget, min_rank=args.min_rank, score=args.rank_score,
             ridge_lambda=args.ridge_lambda, progress=True,
         )
         print(f"[convert]   ranks: min={min(ranks)} max={max(ranks)} "

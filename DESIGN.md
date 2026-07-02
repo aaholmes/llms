@@ -140,6 +140,67 @@ Output:
 
 ---
 
+## Objective, initialization, and healing design
+
+This section formalizes *what* the conversion + healing pipeline minimizes and *why* it is structured as it is. It supersedes the informal "healing = LoRA on the calibration set" of Stage B step 5.
+
+### Prior art and where this sits
+
+Every component of this pipeline has canonical prior art; the design is a re-derivation of the established compression playbook, not a new algorithm. The relevant lineage:
+
+- **MLA (target architecture):** DeepSeek-V2 (Liu et al., arXiv:2405.04434, 2024) — low-rank joint KV compression, 93.3% KV reduction.
+- **Post-hoc GQA→MLA conversion:** TransMLA (Meng et al., arXiv:2502.07864, NeurIPS 2025 Spotlight) — first framework, ~6B-token heal. CARE (arXiv:2603.17946, Mar 2026) — the closest single method to this one (see below). Attention Editing (arXiv:2604.05688, 2026) — random-init + progressive distillation alternative.
+- **Activation-aware SVD:** ASVD (Yuan et al., arXiv:2312.05821, 2023) — introduced weighting SVD by input-activation statistics; SVD-LLM (Wang et al., arXiv:2403.07378, ICLR 2024) — truncation-aware whitening (the `√C·W` formulation used here).
+- **Second-order / Fisher-weighted compression:** OBD (LeCun et al., 1990) → OBS (Hassibi & Stork, 1992) → OBC (Frantar et al., 2022) → GPTQ/SparseGPT. FWSVD (Hsu et al., 2022) weights SVD by the diagonal Fisher; **GFWSVD (Chekalina et al., arXiv:2505.17974, 2025)** generalizes it to a K-FAC Fisher `I_F = A ⊗ B` (input-covariance ⊗ output-gradient-covariance) — the exact factorization invoked in Phase 1.
+- **Distillation recovery:** Hinton, Vinyals & Dean (2015) — the foundational KL-to-teacher-logits mechanism.
+- **LoRA healing of an attention swap:** LoLCATs (Zhang et al., arXiv:2410.10254, 2024) — LoRA recovers quality after a subquadratic-attention swap.
+- **Non-uniform rank allocation:** ASVD's sensitivity-rank search (STRS); AdaSVD/adaCR (arXiv:2502.01403, 2025); CARE's water-filling.
+
+**CARE is the nearest published method** — it combines activation-aware (covariance-whitened) SVD init + water-filling rank allocation + CE+KL healing distillation for MHA/GQA→MLA, and it evaluates Qwen3-4B. This pipeline differs in four concrete ways, none of which CARE covers together: (1) **joint** `[K_nope; V]` latent (shared down-projection, closer to native MLA) vs CARE's **separate** per-matrix K and V factoring; (2) an explicit **Fisher / output-gradient** weighting (GFWSVD-style) on top of the input-covariance whitening CARE stops at; (3) **distill-to-raw-original** as the primary clean estimand (CARE mixes CE+KL and full-finetunes) with **LoRA-scoped** healing; (4) a characterization of **why naive rank allocation fails** that corroborates and explains CARE's own PPL-vs-uniform result. The specific assembly — Fisher-weighted SVD init + distill-to-original refinement + sensitivity-weighted allocation on a *joint* MLA latent — does not appear as a single published method.
+
+### What we actually minimize
+
+The pipeline targets one thing: the compressed model should reproduce the **original model's output distribution**. Per-layer reconstruction error is only a *proxy* for this — adopted because it is closed-form, not because it is the objective. Formally, with original (teacher) `M₀` producing `p₀(·|x)` and compressed student `M_θ = MLA(M₀) + LoRA` producing `p_θ(·|x)`, the ideal objective is
+
+    min_θ  E_x  KL( p₀(·|x) ‖ p_θ(·|x) )
+
+approximated over a finite corpus `D` — we can only be "behavior-aware" on the data we have. **Corollary:** fidelity is only as broad as `D`. Distilling on WikiText preserves the original on WikiText-like inputs, with no guarantee off-distribution. Use as diverse a `D` as feasible, evaluate across domains, and scope claims to `D`'s support.
+
+### Two phases: loss-aware closed-form init, then exact-loss refinement
+
+The objective above is non-convex, so we split it into a cheap init and an iterative refinement — and the key principle is *use the true loss where you can iterate, and its best closed-form surrogate where you cannot.*
+
+**Phase 1 — initialization (closed-form).** A compression perturbation `ΔW` changes the loss, to second order at a converged model, by `ΔL ≈ ½ vec(ΔW)ᵀ F vec(ΔW)` where `F` is the Fisher (Gauss-Newton stand-in for the Hessian). So **Fisher-weighting *is* the loss, to second order** — the best closed-form surrogate. The current activation-aware SVD minimizes `tr(ΔW · C · ΔWᵀ)` with `C = E_D[xxᵀ]`: this is the *change in each layer's output*, weighted by the **input** covariance, implicitly assuming all output directions matter equally to the loss. That is only the input half of the Fisher; the missing **output-sensitivity** half (a backward-pass quantity) is exactly why per-layer reconstruction misranks layers — see the adaptive-rank result below. A Fisher-weighted SVD (empirical Fisher diagonal = `E_D[g²]`, one backward pass) restores the missing half and yields a loss-aware init in closed form.
+
+**Phase 2 — refinement (iterative, exact loss).** Gradient-train the MLA factors (SVD-initialized) and the LoRA adapters (q/o/mlp) **jointly** against the true objective. Since we have the real gradient here, we do **not** use the Fisher surrogate — a quadratic approximation of the loss is strictly dominated by the loss itself. The refinement objective is **forward-KL distillation to a teacher**, `E_{x∈D} Σ_t KL(p_teacher ‖ p_θ)` (the student's cross-entropy against the teacher's soft labels), measured on a **held-out** slice for honest reporting.
+
+### Teacher choice (both correct; primary vs. specialized)
+
+Distilling to a teacher — rather than to one-hot data labels — is what removes the domain-adaptation confound: cross-entropy on data makes the student simultaneously *recover compression* and *learn adaptation*, and those are inseparable under one-hot targets (this is why the CE-heal frontier required an explicit control run to interpret). Choosing the teacher is choosing *what uncompressed behavior to preserve*.
+
+**Primary — teacher = raw original `M₀` (behavior preservation).** The student learns to be "the original model, compressed." This is the fundamental, task-agnostic question and it is self-cleaning:
+- No adaptation is injected, so there is *nothing to control for* — the number is honest by construction.
+- The reference apparatus collapses to a single model: compression cost = held-out `PPL(student) − PPL(M₀)`, or held-out `KL`/top-1 agreement to `M₀`. **No separate control run.**
+- The LoRA is zero-initialized and its role is purely **compression-correction** (not adaptation).
+- The ceiling is `M₀`: `KL → 0` means indistinguishable from the original.
+
+**Secondary — teacher = control `M_ctrl` = `M₀ + LoRA` adapted to a task `T` (specialized).** The student learns to be "the task-adapted model, compressed." Worth running and describing, but not the main focus. Isolates the compression cost *on top of* an adaptation: warm-start the student's LoRA from `M_ctrl`'s LoRA so that at init the *only* teacher-student difference is the MLA compression, and training descends exactly that perturbation.
+
+### Relationship to the results already obtained
+
+- The committed **CE-heal frontier** (V-only 1.33× at +0.5% … 4× at +16% vs a same-budget FT control) is the *task-adaptation* variant, measured with an explicit control. It stays as-is. The distill-to-`M₀` numbers are **not comparable** to it — they target ≈ `PPL(M₀)` + cost (above 21.64), not the adaptation-driven 12.91 — because they measure a different, cleaner quantity (behavior preservation vs. task performance).
+- The **adaptive-rank negative result** (raw-σ² water-filling ≈ 6× worse than uniform on PPL) is the same missing ingredient in a different place: allocating rank by input-weighted reconstruction error drops the output-sensitivity half of the Fisher, so it starves early layers whose errors propagate most. This **corroborates CARE**, whose own table shows adjusted-rank has *higher* PPL than uniform (Llama-8B rank 256: CARE-U 48.35 vs CARE-E 49.43) — non-uniform allocation trades PPL for accuracy, it does not clearly win on PPL. Our raw-σ² score is catastrophic where CARE's **normalized residual-reduction score** `σ²_{r+1} / Σ_{m>r} σ²_m` is merely a near-tie; the normalization makes layers of different spectral scale comparable and prevents early-layer starvation. Two principled fixes to test: (a) CARE's normalized score, (b) Fisher/output-gradient weighting — the *same* signal that makes the Phase-1 init loss-aware.
+
+### Concrete next experiments
+
+1. **Normalized-score rank allocation (reconciliation with CARE).** Swap the raw-σ² allocator score for CARE's normalized residual-reduction `σ²_{r+1} / Σ_{m>r} σ²_m`; re-heal one 4× point. Tests whether normalization lifts the adaptive result from +98% toward uniform and quantifies the naive-vs-normalized gap. Cheapest, highest-information — one-line scorer change + one heal.
+2. **Distill-to-original at 4×.** Teacher `M₀`, forward-KL, zero-init LoRA, SVD warm start. Report held-out PPL, KL, and top-1 agreement vs `M₀`. Primary result.
+3. **Fisher-weighted SVD init.** Empirical Fisher / output-gradient Kronecker factor from one backward pass on `D`; compare pre-FT and post-distill against the covariance-only (`√C`) init CARE stops at.
+4. **Fisher-weighted rank allocation.** Revisit adaptive rank with the output-sensitivity signal instead of reconstruction spectra.
+5. **Secondary: teacher = control variant**, LoRA warm-started from `control_ft/best.pt`.
+
+---
+
 ## Hardware
 
 - **Primary target:** RTX 5060 Ti 16 GB (Blackwell, SM 10.0+).
