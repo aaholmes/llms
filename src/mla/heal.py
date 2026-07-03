@@ -261,6 +261,38 @@ def chunk_ce_loss(logits: torch.Tensor, ids: torch.Tensor) -> torch.Tensor:
     )
 
 
+def chunk_topk_kl_loss(
+    logits: torch.Tensor,
+    teacher_ids: torch.Tensor,
+    teacher_logits: torch.Tensor,
+    *,
+    temperature: float = 1.0,
+) -> torch.Tensor:
+    """Forward KL(teacher ‖ student) over the teacher's top-K support (distillation).
+
+    Both distributions are compared on the teacher's top-K support, each
+    renormalized over those K tokens (a peaked LM puts ~all mass there, so the
+    out-of-K remainder is negligible). Restricting to the shared support makes
+    the loss a proper distribution match: student ≡ teacher ⇒ KL = 0.
+
+    Parameters
+    ----------
+    logits : (1, T, V) student logits (grad).
+    teacher_ids : (T-1, K) long — teacher top-K token indices at scored positions.
+    teacher_logits : (T-1, K) float — teacher top-K raw logits.
+    temperature : softmax temperature τ; loss scaled by τ² (standard KD scaling).
+
+    Returns scalar KL, mean over the T-1 scored positions.
+    """
+    tau = temperature
+    student_logits = logits[0, :-1].float() / tau                     # (T-1, V)
+    student_logits_k = student_logits.gather(-1, teacher_ids)         # (T-1, K)
+    student_lp_k = F.log_softmax(student_logits_k, dim=-1)            # renorm over K
+    teacher_p_k = F.softmax(teacher_logits.float() / tau, dim=-1)     # renorm over K
+    kl = (teacher_p_k * (teacher_p_k.clamp_min(1e-12).log() - student_lp_k)).sum(-1).mean()
+    return kl * (tau * tau)
+
+
 def train_loop(
     model: Qwen3Model,
     optim: torch.optim.Optimizer,
@@ -268,6 +300,7 @@ def train_loop(
     train_chunks: list[torch.Tensor],
     val_chunks: list[torch.Tensor],
     *,
+    teacher: dict | None = None,
     steps: int,
     grad_accum: int,
     seq_len: int,
@@ -312,7 +345,18 @@ def train_loop(
                 # Tight cache: one chunk's worth, freed at end of iter.
                 cache = alloc_mla_cache(model, max_seq_len=ids.shape[1])
                 logits = model(ids, cache, start_pos=0)
-                loss = chunk_ce_loss(logits, ids)
+                if teacher is not None:
+                    # Distill-to-original: forward KL against the frozen teacher's
+                    # precomputed top-K logits (aligned to train_chunks by index).
+                    t_ids = teacher["topk_ids"][idx].to(device)
+                    t_logits = teacher["topk_logits"][idx].to(device)
+                    loss = chunk_topk_kl_loss(
+                        logits, t_ids, t_logits, temperature=teacher["temp"]
+                    )
+                    if teacher["ce_weight"] > 0:
+                        loss = loss + teacher["ce_weight"] * chunk_ce_loss(logits, ids)
+                else:
+                    loss = chunk_ce_loss(logits, ids)
                 (loss / grad_accum).backward()
                 step_loss += float(loss.item()) / grad_accum
                 del cache, logits, loss
@@ -430,6 +474,17 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--train-chunks", type=int, default=20000,
                     help="how many unique training chunks to load (cycled by random sampling)")
     ap.add_argument("--log-every", type=int, default=10)
+    ap.add_argument(
+        "--teacher-topk", default=None,
+        help="path to a precomputed teacher top-K distillation file (from "
+             "experiments/stage_b/precompute_teacher_topk.py). If set, healing "
+             "trains on forward KL to the frozen original instead of cross-entropy "
+             "on data; its chunk pool replaces the sampled train chunks.",
+    )
+    ap.add_argument("--distill-temp", type=float, default=1.0,
+                    help="distillation softmax temperature τ (top-K KL). Default 1.0.")
+    ap.add_argument("--distill-ce-weight", type=float, default=0.0,
+                    help="optional CE-on-data mix added to the KL loss. Default 0 (pure KL).")
     ap.add_argument("--device", default="cuda")
     ap.add_argument(
         "--dtype", default="bfloat16", choices=["bfloat16", "float16", "float32"],
@@ -492,15 +547,32 @@ def main(argv: list[str] | None = None) -> int:
 
     optim = build_optimizer(inventory, lr_mla=args.lr_mla, lr_lora=args.lr_lora)
 
-    print(f"[heal] loading {args.train_chunks} train chunks (seq_len={args.seq_len})", flush=True)
-    train_chunks = load_wikitext103_chunks(
-        n_samples=args.train_chunks,
-        chunk_tokens=args.seq_len,
-        tokenizer_id=model_id,
-        seed=args.split_seed,
-        split="train",
-    )
-    print(f"[heal]   got {len(train_chunks)} chunks", flush=True)
+    teacher = None
+    if args.teacher_topk:
+        # Distill-to-original: the training pool and its per-token labels come
+        # from the precomputed teacher file, so chunks and top-K stay aligned.
+        print(f"[heal] distillation mode: loading teacher top-K {args.teacher_topk}", flush=True)
+        tk = torch.load(args.teacher_topk, map_location="cpu", weights_only=False)
+        train_chunks = [c for c in tk["chunk_ids"]]  # list of (1, T) long
+        teacher = {
+            "topk_ids": tk["topk_ids"],        # (N, T-1, K) long, CPU
+            "topk_logits": tk["topk_logits"],  # (N, T-1, K) float16, CPU
+            "temp": args.distill_temp,
+            "ce_weight": args.distill_ce_weight,
+        }
+        print(f"[heal]   teacher pool: {len(train_chunks)} chunks, K={tk['topk_ids'].shape[-1]}, "
+              f"teacher_model={tk.get('model_id')}, τ={args.distill_temp}, "
+              f"ce_weight={args.distill_ce_weight}", flush=True)
+    else:
+        print(f"[heal] loading {args.train_chunks} train chunks (seq_len={args.seq_len})", flush=True)
+        train_chunks = load_wikitext103_chunks(
+            n_samples=args.train_chunks,
+            chunk_tokens=args.seq_len,
+            tokenizer_id=model_id,
+            seed=args.split_seed,
+            split="train",
+        )
+        print(f"[heal]   got {len(train_chunks)} chunks", flush=True)
 
     print(f"[heal] loading {args.val_chunks} validation chunks", flush=True)
     val_chunks = load_wikitext103_chunks(
@@ -524,6 +596,7 @@ def main(argv: list[str] | None = None) -> int:
 
     train_summary = train_loop(
         model, optim, inventory, train_chunks, val_chunks,
+        teacher=teacher,
         steps=args.steps,
         grad_accum=args.grad_accum,
         seq_len=args.seq_len,

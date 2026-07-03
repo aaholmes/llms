@@ -33,6 +33,7 @@ from mla.heal import (
     LoraLinear,
     build_optimizer,
     chunk_ce_loss,
+    chunk_topk_kl_loss,
     cosine_warmup_multiplier,
     load_trainable,
     save_trainable,
@@ -456,3 +457,42 @@ def test_heal_smoke_cuda(draft_model_id: str, tmp_path: Path) -> None:
     assert summary["best_val_ppl"] < pre["ppl"], (
         f"val_ppl did not drop: pre={pre['ppl']:.4f} best={summary['best_val_ppl']:.4f}"
     )
+
+
+# --- distillation top-K KL loss ------------------------------------------
+
+def test_topk_kl_loss_zero_when_student_matches_teacher():
+    # Student logits == teacher's full logits ⇒ forward KL over the teacher's
+    # top-K support is 0 (student's renormalized top-K probs match the teacher's).
+    torch.manual_seed(0)
+    T, V, K = 6, 40, 8
+    full_logits = torch.randn(T, V)
+    tvals, tids = full_logits[:-1].topk(K, dim=-1)   # (T-1, K)
+    student = full_logits.unsqueeze(0).clone()        # (1, T, V) == teacher
+    kl = chunk_topk_kl_loss(student, tids, tvals, temperature=1.0)
+    assert kl.abs().item() < 1e-5, f"KL should be ~0, got {kl.item()}"
+
+
+def test_topk_kl_loss_positive_and_differentiable():
+    torch.manual_seed(1)
+    T, V, K = 6, 40, 8
+    teacher_full = torch.randn(T, V)
+    tvals, tids = teacher_full[:-1].topk(K, dim=-1)
+    student = torch.randn(1, T, V, requires_grad=True)
+    kl = chunk_topk_kl_loss(student, tids, tvals, temperature=1.0)
+    assert kl.item() > 0
+    kl.backward()
+    # gradient reaches the scored positions [0, T-1)
+    assert student.grad is not None
+    assert student.grad[0, :-1].abs().sum() > 0
+
+
+def test_topk_kl_loss_temperature_scaling_runs():
+    torch.manual_seed(2)
+    T, V, K = 5, 32, 6
+    teacher_full = torch.randn(T, V)
+    tvals, tids = teacher_full[:-1].topk(K, dim=-1)
+    student = torch.randn(1, T, V)
+    for tau in (0.5, 1.0, 2.0):
+        kl = chunk_topk_kl_loss(student, tids, tvals, temperature=tau)
+        assert torch.isfinite(kl) and kl.item() >= 0
