@@ -2,7 +2,7 @@
 
 [![tests](https://github.com/aaholmes/llms/actions/workflows/tests.yml/badge.svg)](https://github.com/aaholmes/llms/actions/workflows/tests.yml)
 
-> **Status — v0.1.** Stage A (engine) and Stage A.5 (Triton kernels) are complete and tested. Stage B (post-hoc MHA→MLA conversion of Qwen3-4B) has the full pipeline shipped end-to-end, including a **LoRA + MLA-projection healing finetune**. The headline: a **4× KV-cache reduction for ~+16 % perplexity** after healing, measured against a same-budget finetuned control (so the figure isolates compression cost from domain adaptation). Without healing the same 4× point is unusable (+826 % PPL); healing closes essentially all of that gap. The full compression–quality frontier (1.33× at +0.5 % up to 5.33× at +41 %), a negative result on per-layer adaptive rank (uniform beats it — even done [CARE](https://arxiv.org/abs/2603.17946)'s way), and a behavioral-fidelity (KL-to-original) view are in the [results](#stage-b-perplexity-results). This pipeline lands in the same place as CARE (Mar 2026), which published the closest method; our distinct pieces are joint `[K;V]` latent factoring, an honest same-budget-control methodology, and the adaptive-rank characterization. Stage C (joint compression × spec-decode sweep at fixed VRAM): pending.
+> **Status — v0.1.** Stage A (engine) and Stage A.5 (Triton kernels) are complete and tested. Stage B (post-hoc MHA→MLA conversion of Qwen3-4B) has the full pipeline shipped end-to-end, including a **LoRA + MLA-projection healing finetune**. The headline: a **4× KV-cache reduction for ~+16 % perplexity** after healing, measured against a same-budget finetuned control (so the figure isolates compression cost from domain adaptation). Without healing the same 4× point is unusable (+826 % PPL); healing closes essentially all of that gap. The full compression–quality frontier (1.33× at +0.5 % up to 5.33× at +41 %), a negative result on per-layer adaptive rank (uniform beats it — even done [CARE](https://arxiv.org/abs/2603.17946)'s way), and a behavioral-fidelity (KL-to-original) view are in the [results](#stage-b-perplexity-results). A **distill-to-original** heal (train on KL to the frozen original, not cross-entropy on data) drives the 4× model to KL 0.40 / 76 % top-1 agreement — closer to the original than a CE-finetuned *uncompressed* model — and a **two-sided Fisher-weighted SVD init** (adding the output-gradient Kronecker factor CARE omits) wins the init A/B on every metric (pre-FT PPL 201→126). This pipeline lands near CARE (Mar 2026), the closest published method; our distinct pieces are joint `[K;V]` latent factoring, the honest same-budget-control methodology, the adaptive-rank negative result, and the Fisher-weighted init. Stage C (joint compression × spec-decode sweep at fixed VRAM): pending.
 
 ## At a glance
 
@@ -129,18 +129,22 @@ Raw-`σ²` water-filling floors the early layers (their K/V spectra decay fast, 
 
 **Behavioral fidelity (KL to the original), not just PPL.** PPL asks "predict the data well"; the project's real objective is "behave like the *original* model." Measured directly — forward `KL(p_original ‖ p_healed)` and top-1 agreement, per token, on a 64-chunk subset:
 
-| Config | Compression | KL to orig (nats) ↓ | Top-1 agree ↑ |
-|---|---:|---:|---:|
-| FT control (uncompressed) | 1.00× | 0.522 | 74.5 % |
-| `r512_drope128` (V-only) | 1.33× | 0.557 | 73.2 % |
-| **`r256_drope32`** (uniform) | 4.00× | **0.639** | **70.0 %** |
-| adaptive normalized (CARE) | 4.00× | 0.665 | 69.1 % |
-| adaptive `min_rank=128` | 4.00× | 0.723 | 67.6 % |
-| adaptive raw `σ²` | 4.00× | 1.116 | 58.5 % |
-| `r192_drope32` | 4.57× | 0.692 | 68.6 % |
-| `r128_drope32` | 5.33× | 0.799 | 65.7 % |
+| Config | Compression | KL to orig (nats) ↓ | Top-1 agree ↑ | PPL |
+|---|---:|---:|---:|---:|
+| FT control (uncompressed) | 1.00× | 0.522 | 74.5 % | 11.13 |
+| `r256_drope32` (uniform, CE-heal) | 4.00× | 0.639 | 70.0 % | 12.91 |
+| adaptive normalized (CARE, CE-heal) | 4.00× | 0.665 | 69.1 % | 13.32 |
+| adaptive raw `σ²` (CE-heal) | 4.00× | 1.116 | 58.5 % | 22.01 |
+| **`r256_drope32` (distill-to-original)** | 4.00× | **0.397** | **76.4 %** | 19.16 |
+| **`r256_drope32` (fisher-distill)** | 4.00× | **0.379** | **76.5 %** | 19.06 |
 
-Two things fall out. First, the KL ranking **exactly matches the PPL ranking** — uniform beats every adaptive scheme including CARE's — so the negative result is robust to the metric, not a PPL artifact. Second, the **uncompressed FT control already sits at KL 0.52 / 74.5 % agreement**: CE-healing on WikiText moves even the un-compressed model substantially away from the original, so on these CE-trained checkpoints KL-to-original is *dominated by adaptation drift*, with compression adding only a little on top (uniform 0.64 vs control 0.52). That is the direct motivation for the **next chapter**: a *distill-to-original* heal (train on KL to the frozen original, not cross-entropy on data) would drive this KL toward 0 and measure compression fidelity with no adaptation confound — see `DESIGN.md`.
+First, among the CE-heal points the KL ranking **exactly matches the PPL ranking** — uniform beats every adaptive scheme including CARE's — so the adaptive-rank negative result is robust to the metric. Second, the **uncompressed FT control already sits at KL 0.52 / 74.5 %**: CE-healing on WikiText moves even the un-compressed model away from the original, so on CE-trained checkpoints KL-to-original is *dominated by adaptation drift*.
+
+![Behavioral fidelity to the original at 4× compression](experiments/stage_b/kl_plot.png)
+
+**Distill-to-original fixes that — and it works.** Training the heal on forward KL to the frozen original (`heal.py --teacher-topk`; teacher logits precomputed offline to dodge the two-models-in-16 GB wall) instead of cross-entropy on data drives the 4× compressed model to **KL 0.40 / 76.4 % agreement** — a 38 % KL reduction over the CE-heal, and *closer to the original than a CE-finetuned uncompressed model* (0.52). It trades data-fit for fidelity by design: PPL rises to ~19 (near the original's 21.6, since it targets behavior not the data), which is exactly why PPL was the wrong lens for this objective.
+
+**Two-sided Fisher-weighted init (the novel piece) wins the A/B.** CARE whitens the SVD by the *input* covariance `√C` (one Kronecker factor of the layer Fisher `F ≈ C ⊗ G`); adding the *output-gradient* factor `√G` (`collect_output_fisher`, one backward pass) makes a loss-aware init. It improves the raw SVD **before any healing (pre-FT PPL 201 → 126)** and holds a consistent edge post-distill on every metric — **KL 0.397 → 0.379, top-1 76.42 → 76.52 %, PPL 19.16 → 19.06**. Modest but consistent, and it is the one component here with no published precedent (CARE stops at `√C`).
 
 Raw artifacts: `experiments/stage_b/eval_summary_frontier.{md,json}` + `frontier_plot.png` (the PPL frontier), `eval_summary_frontier_kl.{md,json}` (KL/agreement), per-point `heal_*/` and `control_ft/` training logs, and the eval drivers `eval_frontier.py` / `eval_frontier_kl.py` / `plot_frontier.py`. Earlier no-FT sweeps: `eval_summary_partial_rope_v2.md`, `eval_summary_v_only.md`. Per-config converted checkpoints under `experiments/stage_b/r*.pt` (gitignored).
 

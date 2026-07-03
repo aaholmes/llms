@@ -191,13 +191,13 @@ Distilling to a teacher — rather than to one-hot data labels — is what remov
 - The committed **CE-heal frontier** (V-only 1.33× at +0.5% … 4× at +16% vs a same-budget FT control) is the *task-adaptation* variant, measured with an explicit control. It stays as-is. The distill-to-`M₀` numbers are **not comparable** to it — they target ≈ `PPL(M₀)` + cost (above 21.64), not the adaptation-driven 12.91 — because they measure a different, cleaner quantity (behavior preservation vs. task performance).
 - The **adaptive-rank negative result** (raw-σ² water-filling ≈ 6× worse than uniform on PPL) is the same missing ingredient in a different place: allocating rank by input-weighted reconstruction error drops the output-sensitivity half of the Fisher, so it starves early layers whose errors propagate most. This **corroborates CARE**, whose own table shows adjusted-rank has *higher* PPL than uniform (Llama-8B rank 256: CARE-U 48.35 vs CARE-E 49.43) — non-uniform allocation trades PPL for accuracy, it does not clearly win on PPL. Our raw-σ² score is catastrophic where CARE's **normalized residual-reduction score** `σ²_{r+1} / Σ_{m>r} σ²_m` is merely a near-tie; the normalization makes layers of different spectral scale comparable and prevents early-layer starvation. Two principled fixes to test: (a) CARE's normalized score, (b) Fisher/output-gradient weighting — the *same* signal that makes the Phase-1 init loss-aware.
 
-### Concrete next experiments
+### Experiments — status
 
-1. **Normalized-score rank allocation (reconciliation with CARE).** Swap the raw-σ² allocator score for CARE's normalized residual-reduction `σ²_{r+1} / Σ_{m>r} σ²_m`; re-heal one 4× point. Tests whether normalization lifts the adaptive result from +98% toward uniform and quantifies the naive-vs-normalized gap. Cheapest, highest-information — one-line scorer change + one heal.
-2. **Distill-to-original at 4×.** Teacher `M₀`, forward-KL, zero-init LoRA, SVD warm start. Report held-out PPL, KL, and top-1 agreement vs `M₀`. Primary result.
-3. **Fisher-weighted SVD init.** Empirical Fisher / output-gradient Kronecker factor from one backward pass on `D`; compare pre-FT and post-distill against the covariance-only (`√C`) init CARE stops at.
-4. **Fisher-weighted rank allocation.** Revisit adaptive rank with the output-sensitivity signal instead of reconstruction spectra.
-5. **Secondary: teacher = control variant**, LoRA warm-started from `control_ft/best.pt`.
+1. ✅ **Normalized-score rank allocation (reconciliation with CARE).** CARE's normalized `σ²_{r+1}/Σσ²` recovers most of the raw-σ² catastrophe (+97.8%→+19.7% vs control) but still trails uniform (+16%) — corroborating CARE's own PPL-vs-uniform finding. See README frontier.
+2. ✅ **Distill-to-original at 4×.** Teacher `M₀`, top-K forward-KL (`src/mla/heal.py --teacher-topk`, teacher logits precomputed offline to dodge the two-models-in-16GB wall). **Result: KL-to-original 0.64 (CE-heal) → 0.40, top-1 70%→76%** — the distilled *compressed* model is behaviorally closer to the original than a CE-finetuned *uncompressed* model (KL 0.52). PPL rises to ~19 (near `M₀`'s 21.6, by design — it targets behavior, not data-fit).
+3. ✅ **Fisher-weighted SVD init.** Output-gradient Kronecker factor (`collect_output_fisher`, one backward pass; two-sided `√G·W·√C` in `activation_aware_factor`). **Wins the A/B on every metric: pre-FT PPL 201→126, and post-distill KL 0.397→0.379, top-1 76.42→76.52, PPL 19.16→19.06.** The one piece with no prior art (CARE stops at input-covariance `√C`).
+4. **Fisher-weighted rank allocation** (pending) — revisit adaptive rank with the output-sensitivity signal instead of reconstruction spectra.
+5. **Secondary: teacher = control variant** (pending), LoRA warm-started from `control_ft/best.pt`.
 
 ---
 

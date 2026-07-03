@@ -12,3 +12,5 @@ Forward KL(p_original ‖ p_healed) and top-1 argmax agreement, per token, over 
 | r256_drope32 (adaptive norm) | 4.00× | 0.665 | 69.1% |
 | r192_drope32 | 4.57× | 0.692 | 68.6% |
 | r128_drope32 | 5.33× | 0.799 | 65.7% |
+| r256_drope32 (distill-to-orig) | 4.00× | 0.397 | 76.4% |
+| r256_drope32 (fisher-distill) | 4.00× | 0.379 | 76.5% |
