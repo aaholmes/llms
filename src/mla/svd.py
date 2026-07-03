@@ -81,23 +81,26 @@ def activation_aware_factor(
     C: torch.Tensor,
     rank: int,
     *,
+    row_weight: torch.Tensor | None = None,
     ridge_lambda: float = 1e-6,
     ridge_max_iters: int = 6,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """Factor W as A B minimizing ‖(AB − W) X‖_F² weighted by C = X Xᵀ.
+    """Factor W as A B minimizing ‖diag(w)(AB − W) X‖_F² weighted by C = X Xᵀ.
+
+    Input side is whitened by the activation covariance ``C`` (as in SVD-LLM /
+    CARE). If ``row_weight`` (``w``, length ``d_out``) is given, the *output*
+    rows are additionally weighted — a two-sided Fisher-weighted objective:
+    with ``w = √diag(G)`` (output-gradient Fisher) this is the K-FAC
+    ``F ≈ C ⊗ G`` init, restoring the output-sensitivity half that
+    input-covariance-only whitening drops. ``row_weight=None`` recovers the
+    original one-sided factorization exactly.
 
     Parameters
     ----------
-    W : (d_out, d_in)
-        Weight matrix to factor.
-    C : (d_in, d_in)
-        Symmetric PSD activation covariance.
-    rank : int
-        Target rank, in ``[1, min(W.shape)]``.
-    ridge_lambda : float
-        Initial ridge factor (scaled by tr(C)/d_in inside).
-    ridge_max_iters : int
-        Cholesky retry budget; on exhaustion, falls back to eigendecomp.
+    W : (d_out, d_in) weight matrix to factor.
+    C : (d_in, d_in) symmetric PSD activation covariance.
+    rank : target rank, in ``[1, min(W.shape)]``.
+    row_weight : (d_out,) non-negative per-output-row weight, or None.
 
     Returns
     -------
@@ -115,7 +118,14 @@ def activation_aware_factor(
     whitening = _ridge_cholesky(C64, ridge_lambda, ridge_max_iters)
     R = whitening.R
 
-    M = W64 @ R.T
+    M = W64 @ R.T  # input-whitened
+
+    if row_weight is not None:
+        # Left-weight the output rows: M' = diag(w) M. Best rank-r of M' then
+        # unwhitens on the input side (B) and un-weights on the output (A).
+        w = row_weight.to(torch.float64).clamp_min(1e-12)  # (d_out,)
+        M = w.unsqueeze(1) * M
+
     U, S, Vh = torch.linalg.svd(M, full_matrices=False)
 
     U_r = U[:, :rank]
@@ -123,6 +133,8 @@ def activation_aware_factor(
     Vh_r = Vh[:rank, :]
 
     A = U_r * S_r.unsqueeze(0)
+    if row_weight is not None:
+        A = A / w.unsqueeze(1)  # undo the output weighting
 
     # B = V_rᵀ R⁻ᵀ. With R upper-triangular, solve R Y = V_rᵀ then B = Yᵀ:
     #   R Y = V_rᵀ  ⟹  Y = R⁻¹ V_rᵀ  ⟹  Yᵀ = V_r R⁻ᵀ = (V_rᵀ R⁻ᵀ)ᵀ ✓

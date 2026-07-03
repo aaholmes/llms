@@ -109,6 +109,20 @@ def _w_stack_for_layer(loaded: LoadedModel, i: int, perms: dict, d_rope: int):
     return W_stack, W_K_nope, W_kr, W_V
 
 
+def _fisher_row_weight(fisher_k_l, fisher_v_l, perms: dict, d_rope: int) -> torch.Tensor:
+    """Per-output-row weight ``√diag(G)`` for the stacked ``[K_nope; V]``, matching
+    the exact row order ``_w_stack_for_layer`` produces (K permuted, V as-is)."""
+    d_nope = perms["d_nope"]
+    fk_perm = fisher_k_l[perms["k_row_perm"]]
+    if d_nope > 0 and d_rope > 0:
+        parts = [fk_perm[perms["nope_rows"]], fisher_v_l]
+    elif d_nope > 0:  # d_rope == 0 → all K rows are nope
+        parts = [fk_perm, fisher_v_l]
+    else:              # d_nope == 0 → V-only stack
+        parts = [fisher_v_l]
+    return torch.sqrt(torch.cat([p.to(torch.float64) for p in parts]).clamp_min(1e-12))
+
+
 def allocate_adaptive_ranks(
     spectra: list[torch.Tensor],
     total_budget: int,
@@ -235,6 +249,7 @@ def convert_loaded_to_mla(
     rank: int,
     d_rope: int,
     ranks: list[int] | None = None,
+    fisher: tuple[list[torch.Tensor], list[torch.Tensor]] | None = None,
     factor_dtype: torch.dtype = torch.bfloat16,
     ridge_lambda: float = 1e-6,
     ridge_max_iters: int = 6,
@@ -347,9 +362,14 @@ def convert_loaded_to_mla(
         # Stacked nope-K + V rows (shared construction with the spectrum pass).
         W_stack, W_K_nope, W_kr, W_V = _w_stack_for_layer(loaded, i, perms, d_rope)
 
+        # Optional two-sided Fisher weighting on the output rows.
+        row_weight = None
+        if fisher is not None:
+            row_weight = _fisher_row_weight(fisher[0][i], fisher[1][i], perms, d_rope)
+
         # Joint SVD over the stack so K-nope and V share W_dkv.
         A, B = activation_aware_factor(
-            W_stack, C, rank=layer_rank,
+            W_stack, C, rank=layer_rank, row_weight=row_weight,
             ridge_lambda=ridge_lambda, ridge_max_iters=ridge_max_iters,
         )
         # Diagnostic: how much C-weighted error is being thrown away?
@@ -402,6 +422,7 @@ def convert_loaded_to_mla(
         "rank": rank,
         "ranks": per_layer_ranks,
         "adaptive_rank": ranks is not None,
+        "fisher_weighted": fisher is not None,
         "d_rope": d_rope,
         "num_layers": num_layers,
         "hidden_size": hidden_size,
@@ -481,6 +502,12 @@ def main(argv: list[str] | None = None) -> int:
         help="device for SVD compute (default cpu; only escalate if wall-clock budget is missed)",
     )
     ap.add_argument("--ridge-lambda", type=float, default=1e-6)
+    ap.add_argument(
+        "--fisher", default=None,
+        help="path to a per-layer output-Fisher file (keys fisher_k, fisher_v) "
+             "from collect_fisher.py. Adds two-sided (input-covariance × "
+             "output-gradient) Fisher weighting to the SVD init.",
+    )
     args = ap.parse_args(argv)
 
     factor_dtype = getattr(torch, args.dtype)
@@ -511,6 +538,13 @@ def main(argv: list[str] | None = None) -> int:
           f"token_count={calib_meta_in.get('token_count', '?')}",
           flush=True)
 
+    fisher = None
+    if args.fisher:
+        print(f"[convert] loading output-Fisher {args.fisher}", flush=True)
+        fdat = torch.load(args.fisher, map_location="cpu", weights_only=False)
+        fisher = (fdat["fisher_k"], fdat["fisher_v"])
+        print(f"[convert]   fisher: {len(fisher[0])} layers (two-sided weighting on)", flush=True)
+
     ranks = None
     if args.adaptive_rank:
         budget = args.rank * loaded.config.num_hidden_layers
@@ -533,6 +567,7 @@ def main(argv: list[str] | None = None) -> int:
         rank=args.rank,
         d_rope=args.d_rope,
         ranks=ranks,
+        fisher=fisher,
         factor_dtype=factor_dtype,
         ridge_lambda=args.ridge_lambda,
         calibration_meta=calib_meta_in,

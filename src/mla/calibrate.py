@@ -23,9 +23,130 @@ Usage:
 from __future__ import annotations
 
 import torch
+import torch.nn.functional as F
 from torch import nn
 
 from engine.model import Qwen3Model
+
+
+class OutputFisherCollector:
+    """Accumulates per-layer diagonal empirical Fisher on the K and V projection outputs.
+
+    The activation-aware SVD whitens by the *input* covariance ``C = E[xxᵀ]`` —
+    one Kronecker factor of the layer Fisher (K-FAC: ``F ≈ C ⊗ G``). This
+    collector supplies the missing *output-sensitivity* factor: the diagonal of
+    ``G = E[g gᵀ]`` where ``g = ∂L/∂(projection output)``, i.e. per output
+    channel how much the loss moves when that channel's K/V output is perturbed.
+    Two-sided weighting the SVD by ``C`` (input) and this diagonal ``G``
+    (output) is a Fisher-weighted init (FWSVD-style diagonal Fisher), the piece
+    an input-covariance-only whitening (CARE) leaves out.
+
+    Empirical Fisher: gradients are taken from the true-next-token loss. Attaches
+    forward hooks to ``attn.k`` / ``attn.v`` (the ``nn.Linear`` projections),
+    registering a tensor backward hook on each output to accumulate ``Σ_t g_t²``
+    per channel. Only ``k``/``v`` weights need ``requires_grad`` — everything
+    else is frozen so backward builds the minimal graph.
+    """
+
+    def __init__(self, model: Qwen3Model, *, accumulator_device=None) -> None:
+        self.num_layers = len(model.layers)
+        dev = accumulator_device or next(model.parameters()).device
+        self._device = torch.device(dev)
+        self._k = [None] * self.num_layers  # lazily sized on first grad
+        self._v = [None] * self.num_layers
+        self._token_count = 0
+        self._hooks: list[torch.utils.hooks.RemovableHandle] = []
+        for i, layer in enumerate(model.layers):
+            self._hooks.append(layer.attn.k.register_forward_hook(self._make_hook(i, "k")))
+            self._hooks.append(layer.attn.v.register_forward_hook(self._make_hook(i, "v")))
+
+    def _make_hook(self, layer_idx: int, which: str):
+        store = self._k if which == "k" else self._v
+
+        def fwd_hook(module, inp, out):
+            # out: (B, T, C). Register a backward hook on it to grab ∂L/∂out.
+            def grad_hook(g):
+                g2 = (g.reshape(-1, g.shape[-1]).to(device=self._device, dtype=torch.float64) ** 2).sum(0)
+                if store[layer_idx] is None:
+                    store[layer_idx] = g2
+                else:
+                    store[layer_idx] = store[layer_idx] + g2
+                if which == "k" and layer_idx == 0:
+                    self._token_count += g.reshape(-1, g.shape[-1]).shape[0]
+            if out.requires_grad:
+                out.register_hook(grad_hook)
+
+        return fwd_hook
+
+    def fishers(self) -> tuple[list[torch.Tensor], list[torch.Tensor]]:
+        """Return ([fisher_k_ℓ], [fisher_v_ℓ]), each (C,) = E[g²] per output channel."""
+        if self._token_count == 0:
+            raise RuntimeError("no gradients accumulated — run forward+backward under hooks")
+        fk = [x / self._token_count for x in self._k]
+        fv = [x / self._token_count for x in self._v]
+        return fk, fv
+
+    def remove_hooks(self) -> None:
+        for h in self._hooks:
+            h.remove()
+        self._hooks.clear()
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        self.remove_hooks()
+
+
+def collect_output_fisher(
+    model: Qwen3Model,
+    prompt_ids: list[torch.Tensor],
+    *,
+    accumulator_device=None,
+    progress_every: int | None = None,
+) -> tuple[list[torch.Tensor], list[torch.Tensor]]:
+    """Forward+backward each prompt through ``model``; return per-layer K/V output Fisher diagonals.
+
+    Freezes all params except ``attn.k``/``attn.v`` weights so backward builds
+    the minimal graph; uses gradient checkpointing when available to bound
+    activation memory. The loss is the model's own next-token cross-entropy
+    (empirical Fisher). Grads on k/v weights are cleared each step (only the
+    hooked output grads are accumulated).
+    """
+    prev_ckpt = getattr(model, "gradient_checkpointing", False)
+    if hasattr(model, "gradient_checkpointing"):
+        model.gradient_checkpointing = True
+    prev_req = {n: p.requires_grad for n, p in model.named_parameters()}
+    for p in model.parameters():
+        p.requires_grad_(False)
+    kv_params = []
+    for layer in model.layers:
+        layer.attn.k.weight.requires_grad_(True)
+        layer.attn.v.weight.requires_grad_(True)
+        kv_params += [layer.attn.k.weight, layer.attn.v.weight]
+
+    try:
+        with OutputFisherCollector(model, accumulator_device=accumulator_device) as col:
+            for i, ids in enumerate(prompt_ids):
+                for p in kv_params:
+                    p.grad = None
+                cache = model.alloc_cache(ids.shape[1])
+                ids = ids.to(next(model.parameters()).device)
+                logits = model(ids, cache, start_pos=0)
+                loss = F.cross_entropy(
+                    logits[0, :-1].float(), ids[0, 1:]
+                )
+                loss.backward()
+                del cache, logits, loss
+                if progress_every and (i + 1) % progress_every == 0:
+                    print(f"[fisher] {i+1}/{len(prompt_ids)} prompts; tokens: {col._token_count}")
+            fk, fv = col.fishers()
+    finally:
+        for n, p in model.named_parameters():
+            p.requires_grad_(prev_req[n])
+        if hasattr(model, "gradient_checkpointing"):
+            model.gradient_checkpointing = prev_ckpt
+    return fk, fv
 
 
 class CovarianceCollector:
