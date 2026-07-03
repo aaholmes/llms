@@ -38,16 +38,20 @@ for (short, _), x, y, off in zip(uniform, uni_x, uni_y, uni_off):
     ax.annotate(f"{short}\n{y:.2f} ({x:.2f}×)", (x, y), textcoords="offset points",
                 xytext=off, fontsize=9, color="tab:blue")
 
-# Adaptive points at 4x (off the frontier).
+# Adaptive points at 4x (all off the frontier — none beat uniform).
+# (label, key, color, label-offset in points) — offsets tuned so the three
+# clustered points near x=4 don't overlap.
 adaptive = [
-    ("adaptive\nmin_rank=8", "r256_drope32 (adaptive)", "tab:red"),
-    ("adaptive\nmin_rank=128", "r256_drope32 (adaptive mr128)", "tab:orange"),
+    ("adaptive: raw σ²", "r256_drope32 (adaptive)", "tab:red", (12, 0)),
+    ("adaptive: min_rank=128", "r256_drope32 (adaptive mr128)", "tab:orange", (14, 6)),
+    ("adaptive: normalized (CARE)", "r256_drope32 (adaptive normalized)", "tab:purple", (-16, 12)),
 ]
-for short, key, c in adaptive:
+for short, key, c, off in adaptive:
     x, y = pts[key]
     ax.plot(x, y, "X", color=c, ms=13, zorder=4)
-    ax.annotate(f"{short}\n{y:.2f}", (x, y), textcoords="offset points",
-                xytext=(10, 4), fontsize=9, color=c, fontweight="bold")
+    ha = "right" if off[0] < 0 else "left"
+    ax.annotate(f"{short}  {y:.2f}", (x, y), textcoords="offset points",
+                xytext=off, fontsize=9, color=c, fontweight="bold", ha=ha)
 
 ax.set_xlabel("KV-cache compression ratio  (× vs baseline)", fontsize=11)
 ax.set_ylabel("Perplexity (250-chunk WikiText-103-val)", fontsize=11)
