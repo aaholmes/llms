@@ -293,6 +293,43 @@ def chunk_topk_kl_loss(
     return kl * (tau * tau)
 
 
+def chunk_topk_accept_loss(
+    logits: torch.Tensor,
+    teacher_ids: torch.Tensor,
+    teacher_logits: torch.Tensor,
+    *,
+    temperature: float = 1.0,
+    softmin_tau: float = 0.0,
+) -> torch.Tensor:
+    """Total-variation loss ``1 − Σ min(p_teacher, p_student)`` on the top-K support.
+
+    ``Σ min(p, q) = 1 − TV(p, q)`` is the expected single-token speculative-decode
+    acceptance rate (Leviathan et al.), so minimizing ``1 − Σ min`` *directly*
+    maximizes acceptance — the sampling-aligned target, unlike KL which is a
+    mode-covering surrogate with a different optimum under a constrained model.
+
+    ``softmin_tau``:
+      - ``0`` → exact ``min`` (autograd-valid a.e.; hard 0/1 gradient).
+      - ``>0`` → numerically-stable soft-min ``min(a,b) − τ·softplus(−|a−b|/τ)``,
+        whose gradient w.r.t. the student is ``σ((p_t − p_s)/τ)`` — a graded
+        sigmoid of the probability gap. → exact min as ``τ → 0``.
+
+    Both distributions are renormalized over the teacher's top-K support (matching
+    :func:`chunk_topk_kl_loss`). Returns ``1 − overlap`` (≥ 0, = 0 at a match).
+    """
+    tau_t = temperature
+    student_logits_k = (logits[0, :-1].float() / tau_t).gather(-1, teacher_ids)  # (T-1,K)
+    p_s = F.softmax(student_logits_k, dim=-1)
+    p_t = F.softmax(teacher_logits.float() / tau_t, dim=-1)
+    if softmin_tau and softmin_tau > 0:
+        s = softmin_tau
+        smin = torch.minimum(p_t, p_s) - s * F.softplus(-(p_t - p_s).abs() / s)
+        overlap = smin.sum(-1)
+    else:
+        overlap = torch.minimum(p_t, p_s).sum(-1)
+    return (1.0 - overlap).mean()
+
+
 def train_loop(
     model: Qwen3Model,
     optim: torch.optim.Optimizer,
@@ -346,13 +383,21 @@ def train_loop(
                 cache = alloc_mla_cache(model, max_seq_len=ids.shape[1])
                 logits = model(ids, cache, start_pos=0)
                 if teacher is not None:
-                    # Distill-to-original: forward KL against the frozen teacher's
-                    # precomputed top-K logits (aligned to train_chunks by index).
+                    # Distill-to-original against the frozen teacher's precomputed
+                    # top-K logits (aligned to train_chunks by index). Objective:
+                    # 'kl' (forward KL surrogate) or 'accept' (direct/soft-min TV,
+                    # targeting speculative-decode acceptance).
                     t_ids = teacher["topk_ids"][idx].to(device)
                     t_logits = teacher["topk_logits"][idx].to(device)
-                    loss = chunk_topk_kl_loss(
-                        logits, t_ids, t_logits, temperature=teacher["temp"]
-                    )
+                    if teacher["objective"] == "accept":
+                        loss = chunk_topk_accept_loss(
+                            logits, t_ids, t_logits, temperature=teacher["temp"],
+                            softmin_tau=teacher["softmin_tau"],
+                        )
+                    else:
+                        loss = chunk_topk_kl_loss(
+                            logits, t_ids, t_logits, temperature=teacher["temp"]
+                        )
                     if teacher["ce_weight"] > 0:
                         loss = loss + teacher["ce_weight"] * chunk_ce_loss(logits, ids)
                 else:
@@ -482,9 +527,15 @@ def main(argv: list[str] | None = None) -> int:
              "on data; its chunk pool replaces the sampled train chunks.",
     )
     ap.add_argument("--distill-temp", type=float, default=1.0,
-                    help="distillation softmax temperature τ (top-K KL). Default 1.0.")
+                    help="distillation softmax temperature τ. Default 1.0.")
     ap.add_argument("--distill-ce-weight", type=float, default=0.0,
-                    help="optional CE-on-data mix added to the KL loss. Default 0 (pure KL).")
+                    help="optional CE-on-data mix added to the distill loss. Default 0.")
+    ap.add_argument("--distill-objective", default="kl", choices=["kl", "accept"],
+                    help="distill target: 'kl' (forward-KL surrogate) or 'accept' "
+                         "(1−TV = speculative-decode acceptance, the sampling-aligned target)")
+    ap.add_argument("--softmin-tau", type=float, default=0.0,
+                    help="soft-min smoothing for --distill-objective accept: 0 = exact "
+                         "min (hard gradient); >0 = smoothed (graded sigmoid gradient)")
     ap.add_argument("--device", default="cuda")
     ap.add_argument(
         "--dtype", default="bfloat16", choices=["bfloat16", "float16", "float32"],
@@ -559,10 +610,13 @@ def main(argv: list[str] | None = None) -> int:
             "topk_logits": tk["topk_logits"],  # (N, T-1, K) float16, CPU
             "temp": args.distill_temp,
             "ce_weight": args.distill_ce_weight,
+            "objective": args.distill_objective,
+            "softmin_tau": args.softmin_tau,
         }
         print(f"[heal]   teacher pool: {len(train_chunks)} chunks, K={tk['topk_ids'].shape[-1]}, "
-              f"teacher_model={tk.get('model_id')}, τ={args.distill_temp}, "
-              f"ce_weight={args.distill_ce_weight}", flush=True)
+              f"teacher_model={tk.get('model_id')}, objective={args.distill_objective}"
+              f"{' (softmin_tau=%.3g)' % args.softmin_tau if args.distill_objective=='accept' else ''}, "
+              f"τ={args.distill_temp}, ce_weight={args.distill_ce_weight}", flush=True)
     else:
         print(f"[heal] loading {args.train_chunks} train chunks (seq_len={args.seq_len})", flush=True)
         train_chunks = load_wikitext103_chunks(

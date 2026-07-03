@@ -35,6 +35,8 @@ POINTS = [
     ("r256_drope32 (adaptive normalized)", "r256_drope32_adaptive_norm.pt", "heal_r256_drope32_adaptive_norm", 4.00),
     ("r256_drope32 (distill-to-orig)", "r256_drope32.pt", "heal_r256_drope32_distill", 4.00),
     ("r256_drope32 (fisher-distill)", "r256_drope32_fisher.pt", "heal_r256_drope32_fisher_distill", 4.00),
+    ("r256_drope32 (accept-direct)", "r256_drope32.pt", "heal_r256_drope32_accept_direct", 4.00),
+    ("r256_drope32 (accept-softmin)", "r256_drope32.pt", "heal_r256_drope32_accept_softmin", 4.00),
     ("r192_drope32", "r192_drope32.pt", "heal_r192_drope32", 4.57),
     ("r128_drope32", "r128_drope32.pt", "heal_r128_drope32", 5.33),
     ("r512_drope128 (V-only)", "r512_drope128.pt", "heal_r512_drope128", 1.33),

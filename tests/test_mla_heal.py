@@ -33,6 +33,7 @@ from mla.heal import (
     LoraLinear,
     build_optimizer,
     chunk_ce_loss,
+    chunk_topk_accept_loss,
     chunk_topk_kl_loss,
     cosine_warmup_multiplier,
     load_trainable,
@@ -496,3 +497,59 @@ def test_topk_kl_loss_temperature_scaling_runs():
     for tau in (0.5, 1.0, 2.0):
         kl = chunk_topk_kl_loss(student, tids, tvals, temperature=tau)
         assert torch.isfinite(kl) and kl.item() >= 0
+
+
+# --- distillation acceptance (1 - TV) loss --------------------------------
+
+def test_accept_loss_zero_when_student_matches_teacher():
+    import math
+    torch.manual_seed(0)
+    T, V, K = 6, 40, 8
+    full = torch.randn(T, V)
+    tvals, tids = full[:-1].topk(K, dim=-1)
+    student = full.unsqueeze(0).clone()   # student == teacher
+    # Hard min: exact overlap ⇒ loss 0.
+    assert chunk_topk_accept_loss(student, tids, tvals, softmin_tau=0.0).abs().item() < 1e-4
+    # Soft min at a tie is min − τ·log2 per token, so a perfect match has a known
+    # non-zero floor K·τ·log2 (the smoothing bias; → 0 as τ → 0).
+    tau = 0.05
+    loss = chunk_topk_accept_loss(student, tids, tvals, softmin_tau=tau).item()
+    assert abs(loss - K * tau * math.log(2)) < 1e-4, f"expected softmin floor, got {loss}"
+
+
+def test_accept_loss_positive_and_differentiable():
+    torch.manual_seed(1)
+    T, V, K = 6, 40, 8
+    teacher_full = torch.randn(T, V)
+    tvals, tids = teacher_full[:-1].topk(K, dim=-1)
+    student = torch.randn(1, T, V, requires_grad=True)
+    loss = chunk_topk_accept_loss(student, tids, tvals, softmin_tau=0.0)
+    assert 0.0 < loss.item() <= 1.0
+    loss.backward()
+    assert student.grad is not None and student.grad[0, :-1].abs().sum() > 0
+
+
+def test_accept_softmin_approaches_hard_min_as_tau_shrinks():
+    torch.manual_seed(2)
+    T, V, K = 5, 32, 6
+    teacher_full = torch.randn(T, V)
+    tvals, tids = teacher_full[:-1].topk(K, dim=-1)
+    student = torch.randn(1, T, V)
+    hard = chunk_topk_accept_loss(student, tids, tvals, softmin_tau=0.0).item()
+    near = chunk_topk_accept_loss(student, tids, tvals, softmin_tau=1e-4).item()
+    far = chunk_topk_accept_loss(student, tids, tvals, softmin_tau=0.2).item()
+    assert abs(near - hard) < 1e-2, f"small tau should approach hard min: {near} vs {hard}"
+    # soft-min ≤ min ⇒ 1−overlap is larger (more) for bigger tau
+    assert far >= hard - 1e-6
+
+
+def test_accept_softmin_gradient_flows():
+    torch.manual_seed(3)
+    T, V, K = 5, 32, 6
+    teacher_full = torch.randn(T, V)
+    tvals, tids = teacher_full[:-1].topk(K, dim=-1)
+    student = torch.randn(1, T, V, requires_grad=True)
+    loss = chunk_topk_accept_loss(student, tids, tvals, softmin_tau=0.05)
+    loss.backward()
+    assert student.grad is not None and torch.isfinite(student.grad).all()
+    assert student.grad[0, :-1].abs().sum() > 0
