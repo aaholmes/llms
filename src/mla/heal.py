@@ -48,6 +48,16 @@ from mla.calibrate import load_wikitext103_chunks
 from mla.swap import alloc_mla_cache, apply_mla
 
 
+def _alloc_cache(model: Qwen3Model, max_seq_len: int):
+    """Compressed MLA cache if the model has MLAttention, else the plain GQA cache.
+
+    Lets the harness heal either an MLA-converted model or a plain model (e.g. a
+    speculative-decode *draft* being TVD-tuned to a target — no MLA swap)."""
+    if any(isinstance(m, MLAttention) for m in model.modules()):
+        return alloc_mla_cache(model, max_seq_len=max_seq_len)
+    return model.alloc_cache(max_seq_len)
+
+
 # --- LoRA wrapper ---------------------------------------------------------
 
 
@@ -381,7 +391,7 @@ def train_loop(
                 idx = int(torch.randint(0, len(train_chunks), (1,), generator=rng).item())
                 ids = train_chunks[idx].to(device)
                 # Tight cache: one chunk's worth, freed at end of iter.
-                cache = alloc_mla_cache(model, max_seq_len=ids.shape[1])
+                cache = _alloc_cache(model, ids.shape[1])
                 logits = model(ids, cache, start_pos=0)
                 if teacher is not None:
                     # Distill-to-original against the frozen teacher's precomputed
@@ -490,8 +500,14 @@ def _write_summary(out_dir: Path, summary: dict) -> None:
 def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(description=__doc__.split("\n", 1)[0])
     ap.add_argument(
-        "--mla-artifact", required=True,
-        help="path to the converted MLA artifact (.pt) produced by mla.convert",
+        "--mla-artifact", default=None,
+        help="path to the converted MLA artifact (.pt) from mla.convert. Omit to heal "
+             "a *plain* model (no MLA swap) named by --model-id — e.g. TVD-tuning a "
+             "speculative-decode draft to a target.",
+    )
+    ap.add_argument(
+        "--model-id", default=None,
+        help="HF model id for a plain (no-MLA) heal, when --mla-artifact is omitted.",
     )
     ap.add_argument("--out", required=True, help="output dir for logs and checkpoints")
     ap.add_argument(
@@ -561,11 +577,18 @@ def main(argv: list[str] | None = None) -> int:
 
     dtype = getattr(torch, args.dtype)
 
-    print(f"[heal] loading artifact {args.mla_artifact}", flush=True)
-    artifact = torch.load(args.mla_artifact, map_location="cpu", weights_only=False)
-    model_id = artifact["meta"]["model_id"]
-    print(f"[heal]   model_id={model_id} rank={artifact['meta']['rank']} "
-          f"d_rope={artifact['meta']['d_rope']}", flush=True)
+    if args.mla_artifact:
+        print(f"[heal] loading artifact {args.mla_artifact}", flush=True)
+        artifact = torch.load(args.mla_artifact, map_location="cpu", weights_only=False)
+        model_id = artifact["meta"]["model_id"]
+        print(f"[heal]   model_id={model_id} rank={artifact['meta']['rank']} "
+              f"d_rope={artifact['meta']['d_rope']}", flush=True)
+    elif args.model_id:
+        artifact = None
+        model_id = args.model_id
+        print(f"[heal] plain heal (no MLA swap), model_id={model_id}", flush=True)
+    else:
+        raise SystemExit("provide either --mla-artifact or --model-id")
 
     print(f"[heal] loading base weights {model_id}", flush=True)
     # Stage the HF weights on CPU and move only the constructed model to the
@@ -579,8 +602,9 @@ def main(argv: list[str] | None = None) -> int:
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
 
-    print("[heal] applying MLA swap", flush=True)
-    apply_mla(model, artifact)
+    if artifact is not None:
+        print("[heal] applying MLA swap", flush=True)
+        apply_mla(model, artifact)
 
     print(f"[heal] wrapping LoRA (rank={args.lora_rank}, alpha={args.lora_alpha})", flush=True)
     n_wrapped = wrap_lora(model, rank=args.lora_rank, alpha=args.lora_alpha)

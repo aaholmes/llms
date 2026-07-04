@@ -553,3 +553,18 @@ def test_accept_softmin_gradient_flows():
     loss.backward()
     assert student.grad is not None and torch.isfinite(student.grad).all()
     assert student.grad[0, :-1].abs().sum() > 0
+
+
+# --- plain-model support (draft TVD-tuning) -------------------------------
+
+def test_alloc_cache_picks_mla_vs_plain():
+    from mla.heal import _alloc_cache
+    from engine.mla import MLAKVCache
+    from engine.kv_cache import KVCache
+    c = Cfg()
+    # Plain model → plain GQA cache.
+    plain = Qwen3Model.from_loaded(tiny_loaded(c, seed=1)).eval()
+    assert isinstance(_alloc_cache(plain, 8), KVCache)
+    # MLA-swapped model → compressed MLA cache.
+    mla_model, _ = _build_mla_model(c)
+    assert isinstance(_alloc_cache(mla_model, 8), MLAKVCache)
