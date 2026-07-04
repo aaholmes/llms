@@ -568,3 +568,26 @@ def test_alloc_cache_picks_mla_vs_plain():
     # MLA-swapped model → compressed MLA cache.
     mla_model, _ = _build_mla_model(c)
     assert isinstance(_alloc_cache(mla_model, 8), MLAKVCache)
+
+
+def test_merge_lora_equals_unmerged_output():
+    from mla.heal import merge_lora
+    torch.manual_seed(0)
+    c = Cfg()
+    model, _ = _build_mla_model(c)
+    wrap_lora(model, rank=4, alpha=8.0)
+    # perturb some LoRA B's out of zero so the merge is non-trivial
+    for m in model.modules():
+        if isinstance(m, LoraLinear):
+            nn.init.normal_(m.lora_B.weight, std=0.05)
+    ids = torch.randint(0, c.vocab_size, (1, 6))
+    cache = alloc_mla_cache(model, max_seq_len=6)
+    with torch.inference_mode():
+        before = model(ids, cache, start_pos=0)
+    merge_lora(model)
+    # no LoraLinear remains
+    assert not any(isinstance(m, LoraLinear) for m in model.modules())
+    cache2 = alloc_mla_cache(model, max_seq_len=6)
+    with torch.inference_mode():
+        after = model(ids, cache2, start_pos=0)
+    assert torch.allclose(before, after, atol=1e-4, rtol=1e-4)

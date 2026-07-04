@@ -125,6 +125,24 @@ def wrap_lora(
     return wrapped
 
 
+def merge_lora(model: nn.Module) -> nn.Module:
+    """Fold every ``LoraLinear`` back into a plain ``nn.Linear`` (W ← W + s·B·A).
+
+    After merging, the model is architecturally identical to the un-adapted
+    original — no LoRA branch, zero inference overhead — so a merged tuned draft
+    runs at exactly the base draft's speed and any throughput difference is
+    attributable to the weights (acceptance), not adapter compute. Mutates in
+    place; returns the model."""
+    for parent in model.modules():
+        for name, child in list(parent.named_children()):
+            if isinstance(child, LoraLinear):
+                with torch.no_grad():
+                    delta = (child.lora_B.weight @ child.lora_A.weight) * child.scaling
+                    child.base.weight.add_(delta.to(child.base.weight.dtype))
+                setattr(parent, name, child.base)
+    return model
+
+
 # --- Trainable-parameter setup --------------------------------------------
 
 
