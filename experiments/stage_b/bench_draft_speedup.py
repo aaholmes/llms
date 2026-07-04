@@ -15,9 +15,14 @@ experiments/stage_b/bench_draft_speedup.{md,json}.
 from __future__ import annotations
 
 import json
+import os
 import statistics
 import time
 from pathlib import Path
+
+# Fight fragmentation across the many per-prompt cache alloc/free cycles — must
+# be set before torch initializes CUDA.
+os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
 
 import torch
 
@@ -30,8 +35,8 @@ from mla.heal import load_trainable, merge_lora, wrap_lora
 TARGET_ID = "Qwen/Qwen3-4B"
 DRAFT_ID = "Qwen/Qwen3-0.6B"
 DEV, DT = "cuda", torch.bfloat16
-N_PROMPTS, PROMPT_TOK, MAX_NEW = 24, 128, 128
-KS = [2, 3, 4]
+N_PROMPTS, PROMPT_TOK, MAX_NEW = 24, 128, 256
+KS = [1, 2, 3, 4, 5, 6, 8]
 SB = Path("experiments/stage_b")
 
 
@@ -80,11 +85,13 @@ def _bench_greedy(target, prompts):
     return MAX_NEW / statistics.median(walls)
 
 
+@torch.inference_mode()  # else the forward graph is retained → activation blowup → OOM
 def _bench_spec(target, draft, prompts, K):
     speculative_generate(target=target, draft=draft, prompt_ids=prompts[0][:, :8].to(DEV),
                          max_new_tokens=4, K=K)  # warmup
     walls, accs = [], []
     for p in prompts:
+        torch.cuda.empty_cache()  # release the previous prompt's transient caches
         p = p.to(DEV)
         torch.cuda.synchronize()
         t0 = time.time()
@@ -104,6 +111,7 @@ def main() -> int:
 
     target = _plain(TARGET_ID)
     greedy_tps = _bench_greedy(target, prompts)
+    torch.cuda.empty_cache()
     print(f"[bench] greedy target: {greedy_tps:.1f} tok/s", flush=True)
 
     results = {"greedy_tok_s": greedy_tps, "drafts": {}}
