@@ -1,298 +1,161 @@
-# Post-hoc MHA→MLA Conversion on a Single GPU
+# Post-hoc MHA→MLA Conversion on a Single GPU — Design
 
-**Activation-aware SVD with partial-RoPE for KV-cache compression of an existing transformer, validated on a from-scratch inference engine**
-
----
-
-## One-line pitch
-
-Convert an existing MHA/GQA-architecture LLM (Qwen3-4B) to Multi-head Latent Attention (MLA) post-hoc, without retraining, via activation-aware SVD with partial-RoPE; validate on a from-scratch single-GPU inference engine; characterize how compression ratio, speculative-decode acceptance rate, and perplexity interact at fixed 16 GB VRAM.
+**Activation-aware SVD with partial-RoPE for KV-cache compression of an already-trained transformer, validated on a from-scratch inference engine.**
 
 ---
 
-## Problem statement
+## Problem
 
-LLM inference on a single consumer GPU is bottlenecked by KV-cache memory and HBM bandwidth. Multi-head Latent Attention (MLA), introduced by DeepSeek-V2 and used by every 2026 frontier model (DeepSeek V3/V4, Kimi K2.6, Nemotron 3), compresses the KV cache by 4–8× by absorbing K and V projections into a low-rank latent. The vast existing population of MHA/GQA models — Llama-3, Qwen3, Mistral — predates MLA and ships with full-size KV caches.
+LLM inference on a single consumer GPU is bottlenecked by KV-cache memory and HBM bandwidth. **Multi-head Latent Attention (MLA)**, introduced in DeepSeek-V2 and used by every 2026 frontier model, compresses the KV cache 4–8× by absorbing the K and V projections into a low-rank latent. But the large existing population of MHA/GQA models — Llama-3, Qwen3, Mistral — predates MLA and ships with a full-size cache.
 
-**Post-hoc conversion of MHA → MLA without retraining** is an emerging research line (MHA2MLA, Liu et al. 2025; SVD-LLM family; activation-aware variants). The technique uses calibration-data-weighted SVD to find the best low-rank approximation of the K/V projections.
+**Post-hoc conversion of MHA/GQA → MLA without retraining** is an emerging research line (TransMLA, MHA2MLA, the SVD-LLM family, CARE). The core tool is a calibration-data-weighted SVD that finds the best low-rank approximation of the K/V projections *on the activations the model actually produces*.
 
-The catch is RoPE. Position-dependent rotation prevents the "absorb" trick that fuses Q-projection with attention into a single matmul on the compressed latent. The standard workaround, **partial-RoPE**, splits each head's dimension into a NoPE latent-absorbed subspace and a small RoPE-only concatenated subspace — the design used by DeepSeek-V3.
+The catch is RoPE. Its position-dependent rotation sits between the Q and K projections and blocks the "absorb" trick that fuses the Q projection into attention over the compressed latent. The standard workaround — **partial RoPE**, from DeepSeek-V3 — splits each head into a no-rotation subspace that is compressed and absorbed, and a small rotated subspace that stays full-rank and is concatenated at attention time.
 
-This project asks: **how cleanly can a public MHA/GQA model be converted to MLA without retraining, and how does the resulting KV compression interact with speculative decoding at a fixed 16 GB VRAM budget?**
+**The question:** how cleanly can a public MHA/GQA model be converted to MLA without retraining, and how does the resulting KV compression interact with speculative decoding at a fixed 16 GB VRAM budget?
 
----
+## Hypothesis and its outcome
 
-## Hypothesis
+The original falsifiable hypothesis was: post-hoc conversion of Qwen3-4B via activation-aware SVD with partial-RoPE achieves **≥4× KV compression at ≤2% perplexity degradation, without any finetune.**
 
-A post-hoc MHA→MLA conversion of Qwen3-4B via activation-aware SVD with partial-RoPE achieves at least **4× KV-cache compression** with **≤2% perplexity degradation** on standard benchmarks (HellaSwag, WikiText-103, MMLU subset), without healing finetune.
+**Outcome: falsified without healing, recovered with a short one.** No-FT 4× compression lands at +826% PPL — the rank-deficiency of the K/V subspaces dominates, and no partial-RoPE fix reaches it. A ~3 h healing finetune closes the gap to **+16% at 4×** (and +0.5% at 1.33×), measured against a same-budget finetuned control. So the precise form of the claim is: *4× KV compression is achievable at modest, bounded cost, but requires a short heal, not zero training.*
 
-The headline question is how MLA compression interacts with speculative decoding under three distinct regimes:
+## The interaction question (planned sweep)
 
-1. **Both uncompressed** — baseline MHA spec decode.
-2. **Target only compressed** — the naive application. The draft was calibrated against the *original* target's distribution; any post-conversion shift in target's logits potentially lowers draft-target agreement, partially offsetting the per-round verification speedup from cheaper KV reads.
-3. **Both target and draft compressed (coupled distortion)** — the non-obvious hypothesis. If the same activation-aware SVD pipeline is applied to both models on the same calibration data, the resulting distortions in target and draft are correlated: both models drift in similar directions, potentially preserving (or even improving) draft-target alignment relative to (2).
+The headline study is how MLA compression interacts with speculative decoding, at a fixed 16 GB VRAM ceiling, across four regimes:
 
-A priori, the sign of the interaction is unclear in any of these regimes. At 4× compression with ≤2% perplexity loss, ~98% of token-level argmaxes are unchanged — acceptance might barely move. The Pareto frontier across (target-compression × draft-compression × draft-K × VRAM ceiling) is the contribution; a finding that coupled distortion preserves acceptance materially better than target-only is the cleanest headline outcome, but a "no significant interaction" result is also informative and publishable.
+1. **Both models uncompressed** — baseline speculative decode; reference acceptance rate and throughput.
+2. **Target compressed, draft not** — the naive application. The draft was calibrated against the *original* target's distribution, so post-conversion drift in the target's logits may lower draft–target agreement, partly offsetting the cheaper KV reads.
+3. **Both compressed at matched ratios (coupled distortion)** — the non-obvious case. Applying the same SVD pipeline and calibration data to both models makes their distortions *correlated* — both drift in similar directions — which may preserve, or even improve, draft–target alignment relative to (2).
+4. **Draft specialized to the compressed target** — instead of shrinking the draft by SVD, align it. The single-token acceptance rate is exactly `Σ_i min(p_i, q_i) = 1 − TVD(p, q)`, where `TVD(p,q) = ½ Σ_i |p_i − q_i|` is the total variation distance (Leviathan et al.). So attach a LoRA to the draft and train it to minimize `E_workload[TVD(p_target, p_draft)]` — maximizing acceptance directly — reusing the same top-K teacher machinery as the heal (here the target is the teacher). This tests "is it better to *shrink* the draft (3) or *align* a small draft to the compressed target (4)?" and unifies the compression and speculative-decode halves under one objective. Caveats to report: exposure bias (train on draft rollouts, not just static text) and single-token TVD vs accept-*run*-length.
 
----
-
-## Approach
-
-- **Host language:** PyTorch with manual forward pass (no `transformers.AutoModelForCausalLM` in the hot path).
-- **Hot-path kernel:** one custom Triton kernel, target chosen by Stage A.5 profiling (likely fused MLA-style attention).
-- **MLA conversion:** activation-aware SVD with calibration-data-weighted truncation; partial-RoPE split following DeepSeek-V3's NoPE-latent + RoPE-concat design.
-- **Calibration data:** ~1k samples from an instruction-tuned set (e.g., Dolly-15k); per-layer input covariances captured during forward passes through the original model.
-- **No healing finetune in v1.** Healing finetune (LoRA-style) is a stretch milestone.
-- **Profiling:** `torch.profiler` for Python-side, NVIDIA Nsight Compute for kernel-level (HBM throughput, L2 hit rate, SM occupancy).
+At 4× compression with ≤2% perplexity loss, ~98% of token-level argmaxes are unchanged, so acceptance may barely move — the sign of every interaction is a priori unclear, and a "no significant interaction" finding is as informative as a positive one. Deliverable: a throughput-vs-perplexity Pareto frontier faceted by regime, plus a regime-delta plot (acceptance under coupled distortion minus target-only, and align-vs-shrink for the specialized draft), and a short writeup.
 
 ---
 
-## Stages
+## Components
 
-### Stage A — Inference engine (DONE)
+### Inference engine (built)
 
-A working from-scratch sequential-speculative-decoding engine for Qwen3-4B (target) + Qwen3-0.6B (draft). Manual forward pass, contiguous KV cache, greedy verification.
+A from-scratch sequential speculative-decoding engine for Qwen3, and the validation harness for everything downstream — every conversion variant is checked by running it end-to-end here.
 
-Status (May 2026):
-- Manual Qwen3 forward pass — RMSNorm, RoPE, GQA + QK-norm, SwiGLU, decoder block. Bit-exact with `transformers.AutoModelForCausalLM` on Qwen3-0.6B.
-- Sequential speculative decode characterized over K ∈ {1,2,3,4,5,7} on RTX 5060 Ti 16 GB BF16, 100 Dolly-15k prompts × 200 generated tokens. **Headline: 1.29× spec/greedy at K=2–3 with Qwen3-0.6B draft (50.3 vs 38.9 tok/s).** Acceptance rate peaks at 78.9% at K=1 but per-round overhead wins; falls to 42.7% at K=7. Self-spec produces token-for-token plain greedy in FP32.
-- Eager greedy matches HuggingFace `AutoModelForCausalLM` with `use_cache=True` to one decimal (38.9 tok/s, 1.00× HF) — confirms the manual forward pass is not pathologically slow despite no `torch.compile`.
-- 79 passing tests on M2 Mac and CUDA desktop (CPU/MPS, BF16 + FP32).
-- E2E bench CLI (`bench.e2e`) and demo CLI (`bench.demo`) for reproducible runs.
+- Manual Qwen3 forward pass (RMSNorm, RoPE, GQA + QK-norm, SwiGLU, decoder block), no `transformers.AutoModelForCausalLM` in the hot path. **Bit-exact with HuggingFace on Qwen3-0.6B.**
+- Greedy decode matches HuggingFace tok/s to one decimal (38.9 tok/s) — confirms the manual path isn't pathologically slow despite no `torch.compile`.
+- Speculative decode swept over K ∈ {1,2,3,4,5,7}, 100 Dolly-15k prompts × 200 tokens, 16 GB Blackwell GPU, BF16. **Headline: 1.29× over greedy at K=2–3** with a Qwen3-0.6B draft (50.3 vs 38.9 tok/s). Acceptance peaks at 78.9% at K=1 but per-round overhead wins at K=2–3; a Qwen3-1.7B draft raises acceptance but its per-step cost outruns the gain, so the smaller draft wins at every K.
 
-Stage A is the validation harness for everything that follows — every conversion or compression variant is checked by running it end-to-end through this engine.
+### Fused Triton kernels (built — negative end-to-end result)
 
-### Stage A.5 — One Triton kernel (DONE)
+Profiling Qwen3-4B BF16 decode showed the hot path is *not* attention (1.5% of wall time) but the per-step linear projections (matmul 77%). At batch=1 these are M=1 GEMV operations that are HBM-bandwidth-bound, not compute-bound. Two fused kernels were shipped and both cleared their isolation microbench gates (fused gate-up-silu 1.05×; fused QKV 1.5–3× vs three separate Linears):
 
-Profile the engine on a CUDA GPU; identify the actual decode-step hot path; implement and microbenchmark a Triton kernel.
+**Neither improved end-to-end speculative decode**, and the QKV kernel slightly hurt it. The reasons, recorded as warnings:
+- **Per-call dispatch overhead × ~14k spec calls per generation.** cuBLAS via PyTorch's caching dispatcher is faster on the per-call axis than Triton's launch + autotune-cache lookup; the microbench wins (~6–12 µs/call) were tiny against ~5 s of decode wall time (max theoretical e2e win ~3%).
+- **BF16 reduction-order non-associativity drops acceptance.** Triton's tiling reduces in a different order than cuBLAS, occasionally flipping an argmax under BF16; greedy verify rejects the rest of the round on a single flip (acceptance fell ~3–4 points).
+- **cuBLAS M=1 GEMV is already near peak HBM bandwidth** (~70% of a 16 GB Blackwell card's ~448 GB/s at 38.9 tok/s). A custom kernel can shave a few percent; it cannot shave 50%.
 
-**Stage A.5 success criteria (original):**
-- Triton kernel ≥ eager equivalent on target shapes (microbenchmark): **MET**.
-- E2E speedup of ≥1.5× over the un-Triton'd Stage A baseline on Qwen3-4B greedy: **NOT MET** (best result 1.04× greedy, 0.97× on the spec hot path).
+Takeaway for the rest of the project: don't spend optimization budget on more batch=1 GEMV kernels. If more speculative speedup is wanted, the real levers are CUDA Graphs (amortize dispatch), probabilistic verify (recover the BF16 acceptance loss), or a fused MLA-attention kernel (a genuinely different shape and bottleneck).
 
-#### Stage A.5 retrospective
+### MLA conversion pipeline (built)
 
-Profile data on Qwen3-4B BF16 decode (`experiments/stage_a/profile_summary.md`) showed matmul = 77.4% of wall time, attention = 1.5%, RMSNorm = 5%. Hot path is *not* attention but the per-step linear projections — at batch=1 these are GEMV (M=1) operations that are HBM-bandwidth-bound rather than compute-bound. Two fused Triton kernels were shipped:
+An `MLAttention` module drops into the existing decoder block in place of `Attention`, parameterized by (compression rank, no-rope/rope split).
 
-- **A.5a — fused gate-up-silu** (`07fe2d6`, [src/kernels/fused_ffn.py](./src/kernels/fused_ffn.py)). Computes `silu(x @ Wg.T) * (x @ Wu.T)` in one launch, fusing the SwiGLU activation into the GEMV. Microbench: 1.05× over eager 2-linear+silu on Qwen3-4B FFN shapes.
-- **A.5b — fused QKV projection** (`7af0978`, [src/kernels/fused_qkv.py](./src/kernels/fused_qkv.py)). Pre-concatenates Wq/Wk/Wv into a single buffer and runs one matmul. Microbench: 1.50–2.98× over eager-3-separate-Linears, but **ties** an eager-concat-Linear (single `nn.Linear` with split) at all M ∈ {1..8} — the win is from concatenation, not from Triton.
+1. **Calibration** — forward Qwen3-4B over ~1k calibration chunks; accumulate per-layer input covariance `C = E[xxᵀ]` (and, for the Fisher init, the output-gradient factor via one backward pass).
+2. **Activation-aware joint SVD** — one SVD per layer over the *stacked* `[W_K_nope; W_V]` rows, giving a **shared** down-projection over K-nope and V (the MLA point), truncated to minimize `‖(W − AB)X‖` over the calibration distribution.
+3. **Partial-RoPE split** — decompose each head into `d_nope + d_rope`; the no-rope subspace goes through the latent, the rope subspace keeps the original Qwen3 RoPE frequency pairs (a permutation places them contiguously at the head's end) and stays full-rank.
+4. **Healing finetune** — full-train the new MLA projections (`dkv`, `uk_nope`, `uv`, `kr`) plus LoRA r=16 on Q/O and the MLP; everything else frozen, gradient-checkpointed to fit Qwen3-4B in 16 GB. Trainable ≈ 92.6 M params.
+5. **Evaluation** — streaming perplexity and KL-to-original on held-out WikiText-103 (disjoint from calibration).
 
-Both kernels cleared their microbench gates but did **not** translate to e2e wins on the spec-decode hot path. At K=4: eager spec = 49.8 tok/s, kerneled spec = 43.7 tok/s (kernel **hurts** by 0.88×). At K=2 and K=3 the same pattern holds.
-
-**Mechanism inventory** (in descending order of estimated contribution):
-1. **Per-call Python/Triton dispatch overhead × ~14k spec calls per 200-token generation.** Each spec round makes K+1 forward passes through 28 decoder layers × 5 ops = ~140 ops/round; at K=4 that's ~700 dispatches per round × 60 rounds ≈ 42k dispatches. Triton's per-call launch + autotune-cache lookup is small but accumulates; cuBLAS via PyTorch's caching dispatcher is faster on the per-call axis.
-2. **BF16 reduction-order non-associativity drops draft/target argmax agreement.** Acceptance rate at K=4 fell from 58.3% (eager) to 54.5% (Triton); at K=3 from 64.5% to 60.8%. Triton's tiling produces a different reduction order than cuBLAS, occasionally flipping argmax under BF16. Greedy verify is unforgiving — a single argmax flip rejects the rest of the round.
-3. **The microbench wins were small in absolute terms (~6-12 µs/call).** At ~120 dispatches per token × 200 tokens × 6 µs = ~144 ms, vs ~5 s of decode wall time per prompt. The maximum theoretical e2e win was ~3% even before factoring in items (1) and (2).
-4. **cuBLAS gemvx on M=1 BF16 GEMV is already near peak HBM bandwidth.** RTX 5060 Ti peak HBM ≈ 448 GB/s; greedy decode at 38.9 tok/s × 8 GB model ≈ 311 GB/s = ~70% of peak. Custom Triton can shave a few percent off; it cannot shave 50%.
-
-**Falsified hypotheses (worth recording as warnings to future-self):**
-- *"A bigger draft model will lift acceptance enough to clear 1.5×."* Tried Qwen3-1.7B as draft; acceptance climbed (64.5% → 70.3% at K=3) but per-step compute cost grew faster (1.29× → 1.19× speedup). The 0.6B draft beats the 1.7B at every K tested.
-- *"Triton kernels that win in microbench will help spec decode if we reduce overhead."* Adding an autotune-cache prewarm (`8566854`) recovered some of the gap (25.9 → 29.2 tok/s on a 64-token demo), but the underlying mechanisms above kept Triton spec ≤ eager spec on a 100-prompt × 200-token formal bench.
-- *"K=4 is roughly optimal for 0.6B/4B at greedy verify."* (DESIGN.md Stage C originally specified K ∈ {3,5,7}, not K ∈ {1,2,3,4,5,7}.) Actual optimum is K=2–3; K=4 is suboptimal by ~3-4%; K=1 is worse than K=2 because per-round overhead dominates one drafted token.
-
-**Implications for future stages:**
-- Stage C's K axis should be {2, 3, 5} not {3, 5, 7} — K=2 and K=3 are tied within run-to-run noise and either is a defensible choice; K=7 is below the per-round-overhead breakeven.
-- Stage B / C's optimization budget should not be spent on more Triton kernels for batch=1 GEMV; the regime is HBM-bound and cuBLAS is already near peak. Real follow-on candidates if more spec speedup is wanted: (a) **CUDA Graphs** to amortize the ~14k dispatch overhead; (b) **probabilistic verify** (Leviathan et al.) to recover the BF16-induced acceptance loss; (c) **fused MLA-style attention** in Stage B, which is a different kernel target (the K/V latent absorb fuses Q and attention into a single op — a different shape and a different bottleneck).
-
-### Stage B — MLA conversion (~3–4 weeks)
-
-Build a `MLAttention` module that drops into the existing decoder block in place of `Attention`, parameterised by (compression ratio, NoPE/RoPE split).
-
-1. **Calibration pipeline:** forward pass Qwen3-4B over ~1k calibration samples; capture per-layer input activations and compute covariances XXᵀ.
-2. **Activation-aware SVD:** for each layer's K and V projections, compute the rank-r approximation that minimises reconstruction error weighted by the activation covariance (the SVD-LLM-family formulation).
-3. **Partial-RoPE split:** decompose each head's `head_dim` into `d_nope + d_rope`. NoPE subspace projects through the compressed latent; RoPE subspace runs through a small uncompressed K projection that is then RoPE-rotated and concatenated for attention.
-4. **Eval:** perplexity on WikiText-103, accuracy on HellaSwag and an MMLU subset, KV memory in bytes/token, throughput. Compare original Qwen3-4B vs MLA-converted variants at compression ratios {2×, 4×, 6×, 8×}.
-5. **Stretch:** healing finetune via LoRA on the calibration set, ~1k–10k steps. Re-eval.
-
-**Stage B success criteria:**
-- ≥4× KV-cache compression with ≤2% perplexity degradation on Qwen3-4B (no FT).
-- Reproducible conversion script: `python -m specd.mla.convert Qwen/Qwen3-4B --rank 128 --d_rope 32 --calib dolly-1k`.
-- Token-for-token greedy match between converted MLA model and a reference HF implementation of MLA at the same compression rank (sanity check on the math).
-
-### Stage C — Interaction characterization (~2 weeks)
-
-Run the joint sweep at fixed 16 GB VRAM ceiling.
-
-Axes:
-- **Target compression ratio:** {1× (baseline MHA), 2×, 4×, 6×, 8×}.
-- **Draft compression ratio:** {1× (uncompressed), matched-to-target, independently-swept}.
-- **Speculative-decode K:** {3, 5, 7}.
-- *(Optional)* INT4 quantization of weights via `bitsandbytes` or hand-rolled.
-
-Three named regimes anchor the (target × draft) plane and are reported individually:
-
-- **R1 — both uncompressed:** baseline MHA spec decode. Establishes the reference acceptance rate and tok/s.
-- **R2 — target only compressed:** measures the verification-speedup vs acceptance-rate-shift trade-off when only the target is converted (the naive application).
-- **R3 — both compressed at matched ratios (coupled distortion):** measures whether applying the same SVD pipeline + calibration data to both models preserves draft-target alignment relative to R2.
-- **R4 — TVD-tuned draft against the (compressed) target:** instead of SVD-compressing the draft, *specialize* it. Define the **total variation distance** `TVD(p,q) = 1 − Σ_i min(p_i, q_i) = ½ Σ_i |p_i − q_i|`; the expected single-token speculative-decode **acceptance rate** is exactly `Σ_i min(p_i, q_i) = 1 − TVD` (Leviathan et al.). So add LoRA to the draft and train it to minimize `E_workload[TVD(p_target, p_draft)]` — i.e. maximize acceptance directly — reusing the exact top-K teacher + soft-min machinery from Stage B (`heal.py --distill-objective accept`; here the *target* is the teacher and the *draft* is the student). Tests "is it better to *shrink* the draft (R3) or to *align* a small draft to the compressed target (R4)?" — unifying the compression and spec-decode halves under one acceptance objective. Because the LoRA is per-(workload, target) it is a swappable adapter (ties to multi-LoRA serving). Caveats to report: exposure bias (train on draft rollouts, not just static text) and single-token TVD vs accept-*run*-length. Prior art: DistillSpec (draft distillation, divergence choice), online speculative decoding (workload adaptation), EAGLE/Medusa (train drafter on target) — the direct-TVD objective + per-workload LoRA is the twist.
-
-Metrics per cell: tok/s, acceptance rate, perplexity (target only — draft perplexity is irrelevant), max usable sequence length, peak VRAM.
-
-Output:
-- Pareto frontier chart (throughput vs perplexity, parameterised by target compression and faceted by regime R1/R2/R3).
-- A "regime delta" plot: acceptance rate at R3 minus acceptance rate at R2 across compression ratios — directly tests the coupled-distortion hypothesis. Add R4 (TVD-tuned draft) to the same plot — the key comparison is R4 vs R3 (align vs shrink the draft) at matched draft budget.
-- 5–10 page writeup. Target: workshop / blog post.
-- Reproducible code + cached calibration data + per-cell logs.
-
-**Stage C success criteria:**
-- Phase diagram across (target compression × draft compression × K) showing where compression is complementary to spec decode vs where it costs more in acceptance than it gains in verification speed.
-- A clear answer on whether coupled distortion (R3) preserves acceptance materially better than target-only (R2). Either sign is publishable; null result is publishable too.
-- One headline number for the abstract / writeup (e.g., "4× KV compression on both target and draft preserves 95% of baseline acceptance rate while extending usable context from X to Y at fixed 16 GB VRAM").
+CLI: `python -m mla.convert Qwen/Qwen3-4B --rank 256 --d-rope 32 --calib wt103-1k`, then `python -m mla.heal --mla-artifact <...>.pt`. Results are in the README; raw artifacts under `experiments/`.
 
 ---
 
-## Objective, initialization, and healing design
+## Objective, initialization, and healing
 
-This section formalizes *what* the conversion + healing pipeline minimizes and *why* it is structured as it is. It supersedes the informal "healing = LoRA on the calibration set" of Stage B step 5.
+This section states *what* the pipeline minimizes and *why* it is structured as it is. Every component has canonical prior art; the design is a considered assembly of the established compression playbook onto a joint MLA latent, with one genuinely new piece.
 
 ### Prior art and where this sits
 
-Every component of this pipeline has canonical prior art; the design is a re-derivation of the established compression playbook, not a new algorithm. The relevant lineage:
+- **MLA (target architecture):** DeepSeek-V2 (Liu et al., 2024).
+- **Post-hoc GQA→MLA:** TransMLA (Meng et al., NeurIPS 2025); **CARE** (arXiv:2603.17946, 2026) — the nearest single method; Attention Editing (2026).
+- **Activation-aware SVD:** ASVD (Yuan et al., 2023); SVD-LLM (Wang et al., ICLR 2024) — the truncation-aware `√C·W` whitening used here.
+- **Fisher-weighted compression:** OBD/OBS/OBC → GPTQ; FWSVD (Hsu et al., 2022); **GFWSVD** (Chekalina et al., 2025) — K-FAC Fisher `F ≈ C ⊗ G` (input-covariance ⊗ output-gradient-covariance), the factorization invoked below.
+- **Distillation recovery:** Hinton et al. (2015). **LoRA healing of an attention swap:** LoLCATs (Zhang et al., 2024).
 
-- **MLA (target architecture):** DeepSeek-V2 (Liu et al., arXiv:2405.04434, 2024) — low-rank joint KV compression, 93.3% KV reduction.
-- **Post-hoc GQA→MLA conversion:** TransMLA (Meng et al., arXiv:2502.07864, NeurIPS 2025 Spotlight) — first framework, ~6B-token heal. CARE (arXiv:2603.17946, Mar 2026) — the closest single method to this one (see below). Attention Editing (arXiv:2604.05688, 2026) — random-init + progressive distillation alternative.
-- **Activation-aware SVD:** ASVD (Yuan et al., arXiv:2312.05821, 2023) — introduced weighting SVD by input-activation statistics; SVD-LLM (Wang et al., arXiv:2403.07378, ICLR 2024) — truncation-aware whitening (the `√C·W` formulation used here).
-- **Second-order / Fisher-weighted compression:** OBD (LeCun et al., 1990) → OBS (Hassibi & Stork, 1992) → OBC (Frantar et al., 2022) → GPTQ/SparseGPT. FWSVD (Hsu et al., 2022) weights SVD by the diagonal Fisher; **GFWSVD (Chekalina et al., arXiv:2505.17974, 2025)** generalizes it to a K-FAC Fisher `I_F = A ⊗ B` (input-covariance ⊗ output-gradient-covariance) — the exact factorization invoked in Phase 1.
-- **Distillation recovery:** Hinton, Vinyals & Dean (2015) — the foundational KL-to-teacher-logits mechanism.
-- **LoRA healing of an attention swap:** LoLCATs (Zhang et al., arXiv:2410.10254, 2024) — LoRA recovers quality after a subquadratic-attention swap.
-- **Non-uniform rank allocation:** ASVD's sensitivity-rank search (STRS); AdaSVD/adaCR (arXiv:2502.01403, 2025); CARE's water-filling.
-
-**CARE is the nearest published method** — it combines activation-aware (covariance-whitened) SVD init + water-filling rank allocation + CE+KL healing distillation for MHA/GQA→MLA, and it evaluates Qwen3-4B. This pipeline differs in four concrete ways, none of which CARE covers together: (1) **joint** `[K_nope; V]` latent (shared down-projection, closer to native MLA) vs CARE's **separate** per-matrix K and V factoring; (2) an explicit **Fisher / output-gradient** weighting (GFWSVD-style) on top of the input-covariance whitening CARE stops at; (3) **distill-to-raw-original** as the primary clean estimand (CARE mixes CE+KL and full-finetunes) with **LoRA-scoped** healing; (4) a characterization of **why naive rank allocation fails** that corroborates and explains CARE's own PPL-vs-uniform result. The specific assembly — Fisher-weighted SVD init + distill-to-original refinement + sensitivity-weighted allocation on a *joint* MLA latent — does not appear as a single published method.
+**CARE is the nearest published method** — activation-aware SVD init + water-filling rank allocation + CE+KL healing, evaluated on Qwen3-4B. This pipeline differs in four ways CARE does not combine: (1) a **joint** `[K_nope; V]` latent with a shared down-projection (closer to native MLA) vs CARE's separate per-matrix factoring; (2) an explicit **output-gradient / Fisher** weighting on top of the input-covariance whitening CARE stops at; (3) **distill-to-raw-original** as the primary clean estimand with **LoRA-scoped** healing; (4) a characterization of **why naive rank allocation fails** that explains CARE's own PPL-vs-uniform result.
 
 ### What we actually minimize
 
-The pipeline targets one thing: the compressed model should reproduce the **original model's output distribution**. Per-layer reconstruction error is only a *proxy* for this — adopted because it is closed-form, not because it is the objective. Formally, with original (teacher) `M₀` producing `p₀(·|x)` and compressed student `M_θ = MLA(M₀) + LoRA` producing `p_θ(·|x)`, the ideal objective is
+The pipeline targets one thing: the compressed model should reproduce the **original model's output distribution**. With original teacher `M₀` producing `p₀` and compressed student `M_θ = MLA(M₀) + LoRA` producing `p_θ`, the ideal objective is
 
     min_θ  E_x  KL( p₀(·|x) ‖ p_θ(·|x) )
 
-approximated over a finite corpus `D` — we can only be "behavior-aware" on the data we have. **Corollary:** fidelity is only as broad as `D`. Distilling on WikiText preserves the original on WikiText-like inputs, with no guarantee off-distribution. Use as diverse a `D` as feasible, evaluate across domains, and scope claims to `D`'s support.
+approximated over a finite corpus `D`. Per-layer reconstruction error is only a closed-form *proxy* for this. **Corollary:** fidelity is only as broad as `D` — distilling on WikiText preserves the original on WikiText-like inputs, with no guarantee off-distribution. Scope claims to `D`'s support.
 
-### Two phases: loss-aware closed-form init, then exact-loss refinement
+### Two phases: loss-aware init, then exact-loss refinement
 
-The objective above is non-convex, so we split it into a cheap init and an iterative refinement — and the key principle is *use the true loss where you can iterate, and its best closed-form surrogate where you cannot.*
+The objective is non-convex, so split it — *use the true loss where you can iterate, and its best closed-form surrogate where you cannot.*
 
-**Phase 1 — initialization (closed-form).** A compression perturbation `ΔW` changes the loss, to second order at a converged model, by `ΔL ≈ ½ vec(ΔW)ᵀ F vec(ΔW)` where `F` is the Fisher (Gauss-Newton stand-in for the Hessian). So **Fisher-weighting *is* the loss, to second order** — the best closed-form surrogate. The current activation-aware SVD minimizes `tr(ΔW · C · ΔWᵀ)` with `C = E_D[xxᵀ]`: this is the *change in each layer's output*, weighted by the **input** covariance, implicitly assuming all output directions matter equally to the loss. That is only the input half of the Fisher; the missing **output-sensitivity** half (a backward-pass quantity) is exactly why per-layer reconstruction misranks layers — see the adaptive-rank result below. A Fisher-weighted SVD (empirical Fisher diagonal = `E_D[g²]`, one backward pass) restores the missing half and yields a loss-aware init in closed form.
+**Phase 1 — closed-form init.** A compression perturbation `ΔW` changes the loss, to second order at a converged model, by `ΔL ≈ ½ vec(ΔW)ᵀ F vec(ΔW)` with `F` the Fisher. So **Fisher-weighting *is* the loss to second order.** The plain activation-aware SVD minimizes `tr(ΔW C ΔWᵀ)` — the change in each layer's *output*, weighted by the **input** covariance `C`, implicitly treating all output directions as equally important. That is only the input half of the Fisher. Adding the missing **output-sensitivity** half (`G`, one backward pass — the two-sided `√G·W·√C`) restores a loss-aware init.
 
-**Phase 2 — refinement (iterative, exact loss).** Gradient-train the MLA factors (SVD-initialized) and the LoRA adapters (q/o/mlp) **jointly** against the true objective. Since we have the real gradient here, we do **not** use the Fisher surrogate — a quadratic approximation of the loss is strictly dominated by the loss itself. The refinement objective is **forward-KL distillation to a teacher**, `E_{x∈D} Σ_t KL(p_teacher ‖ p_θ)` (the student's cross-entropy against the teacher's soft labels), measured on a **held-out** slice for honest reporting.
+**Phase 2 — iterative refinement.** Gradient-train the SVD-initialized MLA factors and the LoRA adapters *jointly* against the true objective — forward-KL distillation to a teacher, `E_{x∈D} Σ_t KL(p_teacher ‖ p_θ)`, on a held-out slice. Since the real gradient is available here, no Fisher surrogate is used — the quadratic approximation is dominated by the loss itself.
 
-### Teacher choice (both correct; primary vs. specialized)
+### Teacher choice
 
-Distilling to a teacher — rather than to one-hot data labels — is what removes the domain-adaptation confound: cross-entropy on data makes the student simultaneously *recover compression* and *learn adaptation*, and those are inseparable under one-hot targets (this is why the CE-heal frontier required an explicit control run to interpret). Choosing the teacher is choosing *what uncompressed behavior to preserve*.
+Distilling to a teacher rather than one-hot data labels is what removes the domain-adaptation confound: cross-entropy on data makes the student *recover compression* and *learn adaptation* inseparably (which is why the CE-heal frontier needs an explicit control to interpret).
 
-**Primary — teacher = raw original `M₀` (behavior preservation).** The student learns to be "the original model, compressed." This is the fundamental, task-agnostic question and it is self-cleaning:
-- No adaptation is injected, so there is *nothing to control for* — the number is honest by construction.
-- The reference apparatus collapses to a single model: compression cost = held-out `PPL(student) − PPL(M₀)`, or held-out `KL`/top-1 agreement to `M₀`. **No separate control run.**
-- The LoRA is zero-initialized and its role is purely **compression-correction** (not adaptation).
-- The ceiling is `M₀`: `KL → 0` means indistinguishable from the original.
+- **Primary — teacher = raw original `M₀`.** The student learns "the original model, compressed." Self-cleaning: nothing to control for, the reference collapses to a single model (cost = held-out `KL`/agreement to `M₀`), the LoRA is pure compression-correction, and `KL → 0` means indistinguishable from the original.
+- **Secondary — teacher = a task-adapted `M₀ + LoRA`.** The student learns "the task-adapted model, compressed," isolating compression cost *on top of* an adaptation; warm-start the student's LoRA from the control's so the only teacher–student difference at init is the MLA compression.
 
-**Secondary — teacher = control `M_ctrl` = `M₀ + LoRA` adapted to a task `T` (specialized).** The student learns to be "the task-adapted model, compressed." Worth running and describing, but not the main focus. Isolates the compression cost *on top of* an adaptation: warm-start the student's LoRA from `M_ctrl`'s LoRA so that at init the *only* teacher-student difference is the MLA compression, and training descends exactly that perturbation.
+### How this connects to the results
 
-### Relationship to the results already obtained
+- The committed **CE-heal frontier** (1.33× at +0.5% … 4× at +16% vs a same-budget control) is the *task-adaptation* variant, measured with an explicit control. The **distill-to-`M₀`** numbers (KL 0.64 → 0.40, top-1 70% → 76%; PPL rises to ~19 near `M₀`'s 21.6, by design) are **not comparable** to it — they measure behavior preservation, a different and cleaner quantity.
+- The **adaptive-rank negative result** is the same missing ingredient in a different place: allocating rank by input-weighted reconstruction error drops the output-sensitivity half of the Fisher, so it starves early layers whose errors propagate most (raw-σ² ≈ +98% vs control; CARE's normalized score recovers most of it to +19.7% but still trails uniform's +16%). This corroborates CARE's own PPL-vs-uniform finding and points at the same fix — output-gradient weighting.
+- The **two-sided Fisher init** wins the A/B on every metric: pre-heal PPL 201 → 126, and post-distill KL 0.397 → 0.379, top-1 76.42 → 76.52%, PPL 19.16 → 19.06. It is the one component here with no published precedent (CARE stops at `√C`).
+- The **acceptance-objective A/B** confirms KL is a surrogate, not the deployment target. Healing the 4× model by minimizing top-K TVD (= maximizing single-token acceptance `Σ min`) *directly* beats KL-distillation on acceptance (**80.3% vs 73.8%**), and — surprisingly — on top-1 (79.2 vs 76.4) and even eval-KL (0.297 vs 0.397): the sampling-aligned objective finds a strictly better point. The exact `min` (hard 0/1 gradient) beat soft-min smoothing (τ=0.05 → 78.2%), which over-flattens the many tiny-probability tokens; a τ=0.01–0.02 sweep is the obvious follow-up but direct already wins.
 
-- The committed **CE-heal frontier** (V-only 1.33× at +0.5% … 4× at +16% vs a same-budget FT control) is the *task-adaptation* variant, measured with an explicit control. It stays as-is. The distill-to-`M₀` numbers are **not comparable** to it — they target ≈ `PPL(M₀)` + cost (above 21.64), not the adaptation-driven 12.91 — because they measure a different, cleaner quantity (behavior preservation vs. task performance).
-- The **adaptive-rank negative result** (raw-σ² water-filling ≈ 6× worse than uniform on PPL) is the same missing ingredient in a different place: allocating rank by input-weighted reconstruction error drops the output-sensitivity half of the Fisher, so it starves early layers whose errors propagate most. This **corroborates CARE**, whose own table shows adjusted-rank has *higher* PPL than uniform (Llama-8B rank 256: CARE-U 48.35 vs CARE-E 49.43) — non-uniform allocation trades PPL for accuracy, it does not clearly win on PPL. Our raw-σ² score is catastrophic where CARE's **normalized residual-reduction score** `σ²_{r+1} / Σ_{m>r} σ²_m` is merely a near-tie; the normalization makes layers of different spectral scale comparable and prevents early-layer starvation. Two principled fixes to test: (a) CARE's normalized score, (b) Fisher/output-gradient weighting — the *same* signal that makes the Phase-1 init loss-aware.
-
-### Experiments — status
-
-1. ✅ **Normalized-score rank allocation (reconciliation with CARE).** CARE's normalized `σ²_{r+1}/Σσ²` recovers most of the raw-σ² catastrophe (+97.8%→+19.7% vs control) but still trails uniform (+16%) — corroborating CARE's own PPL-vs-uniform finding. See README frontier.
-2. ✅ **Distill-to-original at 4×.** Teacher `M₀`, top-K forward-KL (`src/mla/heal.py --teacher-topk`, teacher logits precomputed offline to dodge the two-models-in-16GB wall). **Result: KL-to-original 0.64 (CE-heal) → 0.40, top-1 70%→76%** — the distilled *compressed* model is behaviorally closer to the original than a CE-finetuned *uncompressed* model (KL 0.52). PPL rises to ~19 (near `M₀`'s 21.6, by design — it targets behavior, not data-fit).
-3. ✅ **Fisher-weighted SVD init.** Output-gradient Kronecker factor (`collect_output_fisher`, one backward pass; two-sided `√G·W·√C` in `activation_aware_factor`). **Wins the A/B on every metric: pre-FT PPL 201→126, and post-distill KL 0.397→0.379, top-1 76.42→76.52, PPL 19.16→19.06.** The one piece with no prior art (CARE stops at input-covariance `√C`).
-4. **Fisher-weighted rank allocation** (pending) — revisit adaptive rank with the output-sensitivity signal instead of reconstruction spectra.
-5. **Secondary: teacher = control variant** (pending), LoRA warm-started from `control_ft/best.pt`.
+**Remaining:** the TVD-tuned draft (regime 4 — align a small draft to the target vs shrink it); Fisher-weighted *rank allocation* (revisit adaptive rank with the output-sensitivity signal); and the secondary control-teacher distill variant.
 
 ---
 
 ## Hardware
 
-- **Primary target:** RTX 5060 Ti 16 GB (Blackwell, SM 10.0+).
-- **VRAM budget:** 16 GB. Qwen3-4B in BF16 ≈ 8 GB; baseline KV at long context dominates the rest. The 16 GB ceiling is the *forcing function* for the whole study — it makes "compress to fit" a real engineering constraint, not an academic one.
-- Development on a 16 GB MacBook M2 (MPS / CPU for primitives, no Triton/CUDA). Stage A.5 onward requires the desktop.
-
----
+- **Target:** a 16 GB Blackwell-class consumer GPU (RTX 5060 Ti). Qwen3-4B in BF16 ≈ 8 GB; the KV cache at long context dominates the rest. The 16 GB ceiling is the forcing function for the whole study — "compress to fit" is a real constraint, not an academic one.
+- Engine and primitive development on a 16 GB MacBook M2 (CPU/MPS, no Triton/CUDA); kernel, calibration, and sweep runs on the CUDA desktop.
 
 ## Repo layout
 
 ```
-llms/
-├── DESIGN.md                       # this file (public)
-├── README.md                       # short summary
-├── pyproject.toml
-├── src/
-│   ├── engine/
-│   │   ├── model.py                # manual Qwen3 forward pass
-│   │   ├── attention.py            # GQA + RoPE + KV cache (Stage A)
-│   │   ├── mla.py                  # Stage B: MLAttention module
-│   │   ├── kv_cache.py
-│   │   ├── sampler.py
-│   │   ├── spec_decode.py
-│   │   └── weights.py
-│   ├── kernels/
-│   │   └── attention_triton.py     # Stage A.5 hot-path kernel
-│   ├── mla/                        # Stage B conversion pipeline
-│   │   ├── calibrate.py            # collect activation covariances
-│   │   ├── svd.py                  # activation-aware SVD
-│   │   └── convert.py              # CLI: produce MLA-converted state dict
-│   └── bench/
-│       ├── demo.py
-│       ├── microbench.py
-│       ├── profile.py
-│       └── e2e.py                  # Stage C sweep driver
-├── experiments/
-│   ├── stage_a/
-│   ├── stage_b/                    # conversion runs + eval results
-│   └── stage_c/                    # joint-sweep data + figures
-├── writeup/
-└── tests/
+src/
+  engine/    model.py, attention.py, mla.py (MLAttention runtime + compressed cache),
+             kv_cache.py, sampler.py, spec_decode.py, weights.py
+  kernels/   fused_ffn.py, fused_qkv.py, swap.py, _autotune.py
+  mla/       calibrate.py (covariance + output-Fisher), svd.py (activation-aware SVD),
+             convert.py (joint SVD + partial-RoPE CLI), swap.py, heal.py (healing finetune)
+  bench/     demo.py, e2e.py (sweep driver), profile.py, eval_ppl.py, microbench_*.py
+experiments/ calibration artifacts, conversion runs, eval summaries, frontier/KL plots
+tests/       120 tests; CPU subset runs in CI
 ```
-
----
 
 ## Open questions
 
-- **Calibration sensitivity:** how much does calibration-set composition (instruction-tuned vs base, ~100 vs ~10k samples) move the no-FT perplexity?
-- **Optimal partial-RoPE split:** what `(d_nope, d_rope)` minimizes perplexity at a fixed total head-dim budget?
-- **Compression × spec-decode interaction:** does smaller KV improve acceptance via better cache locality, hurt it via lossy K/V mismatch with the draft, or both depending on regime?
-- **Rank choice per layer:** uniform rank vs adaptive (some layers need more)? SVD-LLM literature is split.
-
----
-
-## Risks and mitigations
-
-| Risk | Mitigation |
-|---|---|
-| Stage B no-FT perplexity is too high (>5% loss at 4×) | Bring forward the LoRA healing-finetune stretch milestone; it's the standard remedy and adds ~1 week. |
-| Activation-aware SVD turns out to require a finetune harness we don't have | Use a published recipe (e.g. MHA2MLA reference code) rather than reinventing; budget 3 days of plumbing. |
-| Stage C interaction story is uninteresting (compression and spec decode are independent) | The Pareto chart itself is still the deliverable — a "they're independent" finding is publishable. Pivot writeup accordingly. |
-| 16 GB VRAM proves too tight even after compression | Drop to Qwen3-1.7B target or cap sequence length. The technique generalizes; the headline number changes. |
-
----
+- **Calibration sensitivity** — how much does calibration-set composition (base vs instruct, 100 vs 10k samples) move the no-FT perplexity?
+- **Optimal partial-RoPE split** — what `(d_nope, d_rope)` minimizes perplexity at fixed head-dim budget?
+- **Compression × speculative-decode interaction** — does a smaller KV help acceptance via cache locality, hurt it via K/V mismatch with the draft, or both by regime? (The planned sweep.)
+- **Adaptive rank done right** — can an end-to-end sensitivity signal (gradient/Hessian/ablation) finally beat uniform where local spectra cannot?
 
 ## Future extensions
 
-The following directions are deferred — each would extend the project past the current 6–10 week budget but is a natural follow-on:
-
-- **SM partitioning study** *(the original direction of this design doc, archived in [`DESIGN-sm-partitioning.md`](./DESIGN-sm-partitioning.md))* — characterize when explicit SM partitioning via CUDA Green Contexts beats default kernel scheduling for two-stream async speculative decoding under HBM contention. Independent research question; uses the same engine substrate.
-- **Probabilistic spec-decode verify** (Leviathan et al.) — replace greedy verification with proper rejection sampling. Required for non-greedy (sampled) generation.
-- **INT4/FP8 weight quantization** stacked on MLA compression. SVD-LLM literature suggests quantization wins below ~4× compression but stacks usefully above.
-- **Healing finetune** as a first-class stage rather than a stretch — small LoRA training run on calibration data to recover the last 1–2% perplexity.
-- **Paged KV cache** (vLLM-style) for multi-batch serving.
-- **Hybrid-architecture extension** — adapt the conversion pipeline for hybrid linear/full attention models (Qwen3.5, LFM2, Nemotron 3).
-
----
+Deferred, each a natural follow-on: probabilistic speculative verify (rejection sampling, for sampled generation); INT4/FP8 weight quantization stacked on MLA; paged KV cache for multi-batch serving; extension of the conversion pipeline to hybrid linear/full-attention models. An SM-partitioning study (via CUDA Green Contexts) on the same engine substrate is archived in [`DESIGN-sm-partitioning.md`](./DESIGN-sm-partitioning.md).
 
 ## References
 
-- DeepSeek-AI. "DeepSeek-V2: A Strong, Economical, and Efficient Mixture-of-Experts Language Model." 2024.
-- DeepSeek-AI. "DeepSeek-V3 Technical Report." 2024.
-- Liu et al. "MHA2MLA: Post-Hoc Conversion of Multi-Head Attention to Multi-head Latent Attention." 2025.
-- Wang et al. "SVD-LLM: Truncation-aware Singular Value Decomposition for Large Language Model Compression." 2024.
-- Lin et al. "AWQ: Activation-aware Weight Quantization for LLM Compression and Acceleration." MLSys 2024.
-- Leviathan, Kalman, Matias. "Fast Inference from Transformers via Speculative Decoding." ICML 2023.
-- Dao. "FlashAttention-2: Faster Attention with Better Parallelism and Work Partitioning." 2023.
-- NVIDIA. CUDA Green Contexts documentation. CUDA Toolkit 12.4+.
-
----
+- DeepSeek-AI. "DeepSeek-V2" (2024); "DeepSeek-V3 Technical Report" (2024).
+- Meng et al. "TransMLA: Multi-Head Latent Attention Is All You Need" (2025).
+- Liu et al. "MHA2MLA: Post-Hoc Conversion of MHA to MLA" (2025).
+- Yuan et al. "ASVD: Activation-aware Singular Value Decomposition" (2023).
+- Wang et al. "SVD-LLM: Truncation-aware SVD for LLM Compression" (ICLR 2024).
+- Hsu et al. "Language Model Compression with Weighted Low-Rank Factorization" (FWSVD, 2022); Chekalina et al. "GFWSVD" (2025).
+- Leviathan, Kalman, Matias. "Fast Inference from Transformers via Speculative Decoding" (ICML 2023).
 
 ## License
 
-Apache License 2.0 — see [`LICENSE`](./LICENSE) for the full text.
+Apache License 2.0 — see [`LICENSE`](./LICENSE).
