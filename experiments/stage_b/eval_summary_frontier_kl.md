@@ -1,6 +1,6 @@
 # Behavioral fidelity to the original
 
-Per-token agreement of each healed model with the frozen original, over a 64-chunk × 1024-tok WT103-val subset. **Accept** = `Σ min(p_orig, p_healed)` = 1−TVD = the sampling-aligned metric (expected single-token speculative-decode acceptance rate). **Top-1** = greedy-decode agreement. **KL** is the training surrogate, reported for completeness. Accept=100% / top1=100% / KL=0 ⇒ identical to the original.
+Per-token agreement of each healed model with the frozen original, over a 64-chunk × 1024-tok WT103-val subset. The **total variation distance** is `TVD(p,q) = 1 − Σ min(p,q) = ½ Σ|p−q|`; **Accept** = `Σ min(p_orig, p_healed)` = `1 − TVD` = the sampling-aligned metric (expected single-token speculative-decode acceptance rate). **Top-1** = greedy-decode agreement. **KL** is the training surrogate, reported for completeness. Accept=100% / top1=100% / KL=0 ⇒ identical to the original.
 
 | Config | Compression | Accept (1−TVD) ↑ | Top-1 agree ↑ | KL (nats) ↓ |
 |---|---:|---:|---:|---:|
@@ -14,3 +14,5 @@ Per-token agreement of each healed model with the frozen original, over a 64-chu
 | r128_drope32 | 5.33× | 61.2% | 65.7% | 0.799 |
 | r256_drope32 (distill-to-orig) | 4.00× | 73.8% | 76.4% | 0.397 |
 | r256_drope32 (fisher-distill) | 4.00× | 74.6% | 76.5% | 0.379 |
+| r256_drope32 (accept-direct) | 4.00× | 80.3% | 79.2% | 0.297 |
+| r256_drope32 (accept-softmin) | 4.00× | 78.2% | 78.8% | 0.315 |
