@@ -119,9 +119,9 @@ def main() -> int:
             lp_o = lp_ref[i].float().to(DEV)                     # (T-1,V) GPU
             p_o = lp_o.exp()
             kl_sum += float((p_o * (lp_o - lp_h)).sum(-1).sum())  # Σ_pos Σ_v p_o (lp_o-lp_h)
-            # Acceptance = Σ_v min(p_o, p_h) = 1 − TV = expected single-token
-            # speculative-decode acceptance rate (Leviathan et al.). The
-            # sampling-aligned fidelity metric; symmetric in the two models.
+            # Acceptance = Σ_v min(p_o, p_h) = 1 − TVD (total variation distance)
+            # = expected single-token speculative-decode acceptance rate
+            # (Leviathan et al.). The sampling-aligned fidelity metric; symmetric.
             accept_sum += float(torch.minimum(p_o, lp_h.exp()).sum(-1).sum())
             agree += int((lp_h.argmax(-1) == am_ref[i].to(DEV)).sum())
             n += lp_h.shape[0]
@@ -129,7 +129,7 @@ def main() -> int:
         top1 = 100.0 * agree / n
         accept = 100.0 * accept_sum / n   # mean over positions of Σmin, as a percentage
         rows.append({"label": label, "compression": comp, "accept_pct": accept,
-                     "top1_agree_pct": top1, "kl_nats": kl, "tv": 1.0 - accept / 100.0})
+                     "top1_agree_pct": top1, "kl_nats": kl, "tvd": 1.0 - accept / 100.0})
         print(f"[kl] {label:32s} comp={comp:.2f}x  accept={accept:.2f}%  "
               f"top1={top1:.2f}%  KL={kl:.4f}", flush=True)
         del model
@@ -139,12 +139,13 @@ def main() -> int:
         json.dumps({"n_chunks": len(chunks), "points": rows}, indent=2))
     md = ["# Behavioral fidelity to the original",
           f"\nPer-token agreement of each healed model with the frozen original, over a "
-          f"{len(chunks)}-chunk × {CHUNK_TOKENS}-tok WT103-val subset. **Accept** = "
-          f"`Σ min(p_orig, p_healed)` = 1−TV = the sampling-aligned metric (expected "
+          f"{len(chunks)}-chunk × {CHUNK_TOKENS}-tok WT103-val subset. The **total "
+          f"variation distance** is `TVD(p,q) = 1 − Σ min(p,q) = ½ Σ|p−q|`; **Accept** = "
+          f"`Σ min(p_orig, p_healed)` = `1 − TVD` = the sampling-aligned metric (expected "
           f"single-token speculative-decode acceptance rate). **Top-1** = greedy-decode "
           f"agreement. **KL** is the training surrogate, reported for completeness. "
           f"Accept=100% / top1=100% / KL=0 ⇒ identical to the original.\n",
-          "| Config | Compression | Accept (1−TV) ↑ | Top-1 agree ↑ | KL (nats) ↓ |",
+          "| Config | Compression | Accept (1−TVD) ↑ | Top-1 agree ↑ | KL (nats) ↓ |",
           "|---|---:|---:|---:|---:|"]
     for r in rows:
         md.append(f"| {r['label']} | {r['compression']:.2f}× | {r['accept_pct']:.1f}% | "

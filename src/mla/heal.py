@@ -301,12 +301,13 @@ def chunk_topk_accept_loss(
     temperature: float = 1.0,
     softmin_tau: float = 0.0,
 ) -> torch.Tensor:
-    """Total-variation loss ``1 − Σ min(p_teacher, p_student)`` on the top-K support.
+    """Total-variation-distance loss ``TVD = 1 − Σ min(p_teacher, p_student)`` on the top-K support.
 
-    ``Σ min(p, q) = 1 − TV(p, q)`` is the expected single-token speculative-decode
-    acceptance rate (Leviathan et al.), so minimizing ``1 − Σ min`` *directly*
-    maximizes acceptance — the sampling-aligned target, unlike KL which is a
-    mode-covering surrogate with a different optimum under a constrained model.
+    The total variation distance ``TVD(p, q) = 1 − Σ_i min(p_i, q_i) = ½ Σ_i |p_i − q_i|``;
+    its complement ``Σ min(p, q) = 1 − TVD`` is the expected single-token
+    speculative-decode acceptance rate (Leviathan et al.), so minimizing TVD
+    *directly* maximizes acceptance — the sampling-aligned target, unlike KL which
+    is a mode-covering surrogate with a different optimum under a constrained model.
 
     ``softmin_tau``:
       - ``0`` → exact ``min`` (autograd-valid a.e.; hard 0/1 gradient).
@@ -385,7 +386,7 @@ def train_loop(
                 if teacher is not None:
                     # Distill-to-original against the frozen teacher's precomputed
                     # top-K logits (aligned to train_chunks by index). Objective:
-                    # 'kl' (forward KL surrogate) or 'accept' (direct/soft-min TV,
+                    # 'kl' (forward KL surrogate) or 'accept' (direct/soft-min TVD,
                     # targeting speculative-decode acceptance).
                     t_ids = teacher["topk_ids"][idx].to(device)
                     t_logits = teacher["topk_logits"][idx].to(device)
@@ -532,7 +533,7 @@ def main(argv: list[str] | None = None) -> int:
                     help="optional CE-on-data mix added to the distill loss. Default 0.")
     ap.add_argument("--distill-objective", default="kl", choices=["kl", "accept"],
                     help="distill target: 'kl' (forward-KL surrogate) or 'accept' "
-                         "(1−TV = speculative-decode acceptance, the sampling-aligned target)")
+                         "(1−TVD = speculative-decode acceptance, the sampling-aligned target)")
     ap.add_argument("--softmin-tau", type=float, default=0.0,
                     help="soft-min smoothing for --distill-objective accept: 0 = exact "
                          "min (hard gradient); >0 = smoothed (graded sigmoid gradient)")
