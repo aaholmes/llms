@@ -56,8 +56,8 @@ A **two-sided Fisher-weighted SVD initialization** — adding the output-gradien
 - **Two fused Triton kernels** — they win in isolation but do *not* beat cuBLAS end-to-end at batch=1: the decode path is memory-bandwidth-bound and per-launch overhead erodes the gain. Post-mortem in [`DESIGN.md`](./DESIGN.md).
 - **Conversion pipeline** — calibration, activation-aware joint SVD, partial-RoPE swap, perplexity/KL evaluation, and the healing finetune (`src/mla/`).
 
-**Planned:**
-- **Joint sweep** — how KV compression, draft-model choice, and speculative-decode depth trade off at a fixed 16 GB VRAM budget. This is the headline study the whole pipeline was built to run.
+**In progress:**
+- **Joint sweep** — how KV compression, draft-model choice, and speculative-decode depth trade off at a fixed 16 GB VRAM budget; the headline study the whole pipeline was built to run. First data point: training a small draft to *match* the target (rather than shrinking it) raises its single-token acceptance **59% → 68%**. Next: end-to-end throughput across the full grid.
 
 ## Run it
 
