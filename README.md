@@ -37,7 +37,11 @@ Without any finetuning, 4× KV compression is unusable (+826% PPL). After healin
 
 The matched control is the crux. A same-budget finetune of the *uncompressed* model reaches roughly the same absolute PPL on its own (it's mostly WikiText adaptation), so comparing against the raw baseline would flatter the result by ~40 points. The +16% is the true marginal cost of 4× compression.
 
-**Behavioral fidelity.** The real objective isn't "predict WikiText" — it's "behave like the original model." Training the heal on KL-divergence to the frozen original (instead of cross-entropy on data) drives the 4× model to **KL 0.40 / 76% top-1 agreement** with the original — closer than even a finetuned *uncompressed* model gets. But KL is a *surrogate*: the deployment-relevant metric is **acceptance** — the fraction of tokens a verifier would accept, `Σ min(p, q) = 1 − TVD`, the total-variation-distance complement (and exactly the single-token speculative-decode acceptance rate). Training the heal to minimize TVD directly, instead of KL, beats the surrogate on its own turf — **80% acceptance at 4×, vs 74% for KL** (and better on KL and top-1 too). Optimizing the deployment metric wins over the smooth surrogate. A two-sided Fisher-weighted SVD initialization (adding the output-gradient term the nearest published method omits) improves the init before any healing and holds a small consistent edge after.
+**Behavioral fidelity.** The real objective isn't "predict WikiText" — it's "behave like the original model." Training the heal on KL-divergence to the frozen original (rather than cross-entropy on data) drives the 4× model to **KL 0.40 / 76% top-1 agreement** — closer to the original than even a finetuned *uncompressed* model gets.
+
+But KL is a *surrogate*. What a speculative-decode verifier actually cares about is **acceptance** — the fraction of the compressed model's tokens the original would accept, `Σ min(p, q) = 1 − TVD`. Training the heal to maximize acceptance *directly* beats the KL-trained model on its own terms: **80% acceptance at 4× vs 74%**, and better on KL and top-1 agreement too. Optimizing the deployment metric wins over the smooth surrogate.
+
+A **two-sided Fisher-weighted SVD initialization** — adding the output-gradient term the nearest published method omits — improves the starting point before any healing and holds a small consistent edge after.
 
 ![Behavioral fidelity to the original at 4× compression](experiments/stage_b/kl_plot.png)
 
