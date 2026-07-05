@@ -104,18 +104,33 @@ def _bench_spec(target, draft, prompts, K):
 
 
 def main() -> int:
-    chunks = load_wikitext103_chunks(n_samples=N_PROMPTS, chunk_tokens=PROMPT_TOK,
-                                     tokenizer_id=TARGET_ID, split="validation")
-    prompts = [c[:, :PROMPT_TOK] for c in chunks]
-    print(f"[bench] {len(prompts)} prompts × {PROMPT_TOK} tok → {MAX_NEW} new", flush=True)
+    import argparse
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--corpus", default="wikitext", choices=["wikitext", "code"],
+                    help="held-out prompt workload (must match the draft's tuning corpus)")
+    ap.add_argument("--tuned-dir", default="heal_draft_0_6b_tvd", help="tuned-draft heal dir")
+    ap.add_argument("--tuned-label", default="tvd-tuned")
+    ap.add_argument("--out-suffix", default="", help="suffix for output md/json (e.g. _code)")
+    args = ap.parse_args()
+
+    if args.corpus == "code":
+        from mla.calibrate import load_code_chunks
+        # held-out: skip past the ~10-12k examples the teacher/tuning consumed
+        chunks = load_code_chunks(n_samples=N_PROMPTS + 8, chunk_tokens=PROMPT_TOK,
+                                  tokenizer_id=TARGET_ID, skip=20000)
+    else:
+        chunks = load_wikitext103_chunks(n_samples=N_PROMPTS, chunk_tokens=PROMPT_TOK,
+                                         tokenizer_id=TARGET_ID, split="validation")
+    prompts = [c[:, :PROMPT_TOK] for c in chunks][:N_PROMPTS]
+    print(f"[bench] {len(prompts)} {args.corpus} prompts × {PROMPT_TOK} tok → {MAX_NEW} new", flush=True)
 
     target = _plain(TARGET_ID)
     greedy_tps = _bench_greedy(target, prompts)
     torch.cuda.empty_cache()
     print(f"[bench] greedy target: {greedy_tps:.1f} tok/s", flush=True)
 
-    results = {"greedy_tok_s": greedy_tps, "drafts": {}}
-    for label, heal_dir in [("base", None), ("tvd-tuned", "heal_draft_0_6b_tvd")]:
+    results = {"greedy_tok_s": greedy_tps, "corpus": args.corpus, "drafts": {}}
+    for label, heal_dir in [("base", None), (args.tuned_label, args.tuned_dir)]:
         draft = _plain(DRAFT_ID) if heal_dir is None else _tuned_draft(heal_dir)
         per_k = {}
         for K in KS:
@@ -127,23 +142,24 @@ def main() -> int:
         del draft
         torch.cuda.empty_cache()
 
-    (SB / "bench_draft_speedup.json").write_text(json.dumps(results, indent=2))
+    sfx = args.out_suffix
+    (SB / f"bench_draft_speedup{sfx}.json").write_text(json.dumps(results, indent=2))
     best = {lab: max(d.values(), key=lambda r: r["tok_s"]) for lab, d in results["drafts"].items()}
     md = ["# End-to-end spec-decode speedup: base vs TVD-tuned draft\n",
-          f"Qwen3-0.6B draft → Qwen3-4B target, greedy-verify, {len(prompts)} WikiText-val "
+          f"Qwen3-0.6B draft → Qwen3-4B target, greedy-verify, {len(prompts)} {args.corpus} "
           f"prompts × {PROMPT_TOK}→{MAX_NEW} tok. Greedy target baseline: **{greedy_tps:.1f} tok/s**. "
           f"Tuned draft has its LoRA merged (same speed as base; only weights differ).\n",
           "| Draft | K | tok/s | speedup vs greedy | acceptance |", "|---|---:|---:|---:|---:|"]
     for label, d in results["drafts"].items():
         for K, r in d.items():
             md.append(f"| {label} | {K} | {r['tok_s']:.1f} | {r['speedup']:.2f}× | {r['acceptance']*100:.1f}% |")
-    b, t = best["base"], best["tvd-tuned"]
+    b, t = best["base"], best[args.tuned_label]
     md.append(f"\n**Best-K: base {b['tok_s']:.1f} tok/s ({b['speedup']:.2f}×) → "
               f"tuned {t['tok_s']:.1f} tok/s ({t['speedup']:.2f}×)** "
               f"— a {t['tok_s']/b['tok_s']:.2f}× throughput gain from TVD-tuning the draft "
               f"(acceptance {b['acceptance']*100:.1f}% → {t['acceptance']*100:.1f}%).")
-    (SB / "bench_draft_speedup.md").write_text("\n".join(md) + "\n")
-    print("[bench] wrote bench_draft_speedup.{md,json}", flush=True)
+    (SB / f"bench_draft_speedup{sfx}.md").write_text("\n".join(md) + "\n")
+    print(f"[bench] wrote bench_draft_speedup{sfx}.{{md,json}}", flush=True)
     return 0
 
 

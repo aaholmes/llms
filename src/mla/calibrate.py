@@ -299,3 +299,43 @@ def load_wikitext103_chunks(
             if len(chunks) >= n_samples:
                 return chunks
     return chunks
+
+
+def load_code_chunks(
+    n_samples: int,
+    *,
+    chunk_tokens: int = 256,
+    tokenizer_id: str = "Qwen/Qwen3-4B",
+    seed: int = 42,
+    skip: int = 0,
+    language: str = "Python",
+) -> list[torch.Tensor]:
+    """Sample ``n_samples`` chunks of Python code — a *narrow* workload for the
+    draft-optimizer (repetitive syntax → high draft–target acceptance headroom),
+    contrast to the broad WikiText corpus.
+
+    Uses ``flytech/python-codes-25k`` (ungated, parquet) raw-code field, skipping
+    the first ``skip`` examples so train and held-out slices are disjoint.
+    Returns a list of (1, chunk_tokens) long tensors. ``language`` is accepted for
+    signature parity but this corpus is Python-only.
+    """
+    from datasets import load_dataset
+    from transformers import AutoTokenizer
+
+    tok = AutoTokenizer.from_pretrained(tokenizer_id)
+    ds = load_dataset("flytech/python-codes-25k", split="train")
+    chunks: list[torch.Tensor] = []
+    buffer: list[int] = []
+    for i in range(skip, len(ds)):
+        ex = ds[i]
+        text = ex.get("output") or ex.get("content") or ex.get("text") or ""
+        if not text.strip():
+            continue
+        ids = tok(text, return_tensors="pt", add_special_tokens=False).input_ids[0]
+        buffer.extend(ids.tolist())
+        while len(buffer) >= chunk_tokens:
+            chunks.append(torch.tensor(buffer[:chunk_tokens], dtype=torch.long).unsqueeze(0))
+            buffer = buffer[chunk_tokens:]
+            if len(chunks) >= n_samples:
+                return chunks
+    return chunks

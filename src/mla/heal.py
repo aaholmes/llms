@@ -551,6 +551,8 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--grad-clip", type=float, default=1.0)
     ap.add_argument("--val-every", type=int, default=200)
     ap.add_argument("--val-chunks", type=int, default=250)
+    ap.add_argument("--val-corpus", default="wikitext", choices=["wikitext", "code"],
+                    help="validation workload; use 'code' when TVD-tuning a draft on code")
     ap.add_argument("--train-chunks", type=int, default=20000,
                     help="how many unique training chunks to load (cycled by random sampling)")
     ap.add_argument("--log-every", type=int, default=10)
@@ -671,14 +673,22 @@ def main(argv: list[str] | None = None) -> int:
         )
         print(f"[heal]   got {len(train_chunks)} chunks", flush=True)
 
-    print(f"[heal] loading {args.val_chunks} validation chunks", flush=True)
-    val_chunks = load_wikitext103_chunks(
-        n_samples=args.val_chunks,
-        chunk_tokens=args.seq_len,
-        tokenizer_id=model_id,
-        seed=args.split_seed,
-        split="validation",
-    )
+    print(f"[heal] loading {args.val_chunks} {args.val_corpus} validation chunks", flush=True)
+    if args.val_corpus == "code":
+        from mla.calibrate import load_code_chunks
+        # held-out slice: past the teacher/tuning region (skip=0..~12k), before the bench's skip=20000
+        val_chunks = load_code_chunks(
+            n_samples=args.val_chunks, chunk_tokens=args.seq_len,
+            tokenizer_id=model_id, skip=15000,
+        )
+    else:
+        val_chunks = load_wikitext103_chunks(
+            n_samples=args.val_chunks,
+            chunk_tokens=args.seq_len,
+            tokenizer_id=model_id,
+            seed=args.split_seed,
+            split="validation",
+        )
     print(f"[heal]   got {len(val_chunks)} chunks", flush=True)
 
     # Baseline pre-training PPL on the validation slice.

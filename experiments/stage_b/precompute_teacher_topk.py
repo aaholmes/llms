@@ -36,18 +36,25 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--k", type=int, default=64, help="top-K to store per position")
     ap.add_argument("--split-seed", type=int, default=17, help="match heal --split-seed")
     ap.add_argument("--split", default="train")
+    ap.add_argument("--corpus", default="wikitext", choices=["wikitext", "code"],
+                    help="teacher workload: wikitext (broad) or code (narrow)")
     ap.add_argument("--out", default="experiments/stage_b/teacher_topk_wt103_2k.pt")
     ap.add_argument("--dtype", default="bfloat16", choices=["bfloat16", "float16", "float32"])
     ap.add_argument("--device", default="cuda")
     args = ap.parse_args(argv)
 
     dtype = getattr(torch, args.dtype)
-    print(f"[teacher] loading {args.n_chunks} chunks (seq_len={args.seq_len}, "
-          f"seed={args.split_seed}, split={args.split})", flush=True)
-    chunks = load_wikitext103_chunks(
-        n_samples=args.n_chunks, chunk_tokens=args.seq_len,
-        tokenizer_id=args.model_id, seed=args.split_seed, split=args.split,
-    )
+    print(f"[teacher] loading {args.n_chunks} {args.corpus} chunks (seq_len={args.seq_len}, "
+          f"seed={args.split_seed})", flush=True)
+    if args.corpus == "code":
+        from mla.calibrate import load_code_chunks
+        chunks = load_code_chunks(n_samples=args.n_chunks, chunk_tokens=args.seq_len,
+                                  tokenizer_id=args.model_id, seed=args.split_seed, skip=0)
+    else:
+        chunks = load_wikitext103_chunks(
+            n_samples=args.n_chunks, chunk_tokens=args.seq_len,
+            tokenizer_id=args.model_id, seed=args.split_seed, split=args.split,
+        )
     print(f"[teacher]   got {len(chunks)} chunks", flush=True)
 
     print(f"[teacher] loading {args.model_id}", flush=True)
