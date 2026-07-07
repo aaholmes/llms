@@ -1,6 +1,6 @@
-# Post-hoc MHA→MLA Conversion on a Single GPU — Design
+# Lossy Attention Blocks + a TVD-Trained Corrector — Design
 
-**Activation-aware SVD with partial-RoPE for KV-cache compression of an already-trained transformer, validated on a from-scratch inference engine.**
+**Retrofit a lossy attention block onto an already-trained transformer — KV-cache compression (MLA) or a workload-specialized draft — and repair the distributional drift with a small LoRA trained to minimize total-variation distance to the original, validated on a from-scratch inference engine.**
 
 ---
 
@@ -19,6 +19,22 @@ The catch is RoPE. Its position-dependent rotation sits between the Q and K proj
 The original falsifiable hypothesis was: post-hoc conversion of Qwen3-4B via activation-aware SVD with partial-RoPE achieves **≥4× KV compression at ≤2% perplexity degradation, without any finetune.**
 
 **Outcome: falsified without healing, recovered with a short one.** No-FT 4× compression lands at +826% PPL — the rank-deficiency of the K/V subspaces dominates, and no partial-RoPE fix reaches it. A ~3 h healing finetune closes the gap to **+16% at 4×** (and +0.5% at 1.33×), measured against a same-budget finetuned control. So the precise form of the claim is: *4× KV compression is achievable at modest, bounded cost, but requires a short heal, not zero training.*
+
+## The unifying frame: lossy blocks + a TVD-trained corrector
+
+MLA conversion and draft-tuning read as separate projects but are one pattern. Each takes an already-trained model, swaps in a **lossy attention block on some efficiency axis**, and repairs the resulting distributional drift with a **small LoRA trained to minimize total-variation distance to the original**:
+
+- **MLA** shrinks the *entry size* — a rank-`r` latent in place of full-head K/V. Saves KV storage and read bandwidth; adds reconstruct compute. Corrector: the healing LoRA plus the trained latent factors.
+- **Draft-tuning** shrinks the *proposer size* — a 0.6B draft for a 4B target. Saves per-token weight bandwidth; costs single-token agreement. Corrector: a merged rank-16 LoRA on the draft.
+
+The shared objective is `TVD(p₀, p_θ) = ½‖p₀ − p_θ‖₁`, equivalently `1 − Σ min(p₀, p_θ)`. The same scalar reads two ways depending on how the lossy model is deployed:
+
+- **Fidelity**, when it *replaces* the original (standalone MLA): `1 − TVD` is the fraction of probability mass the two models agree on — the tightest bound on how often behavior can diverge on any bounded downstream measure. It is the quantity to minimize in preference to KL (unbounded, tail-dominated, a smooth *surrogate* for it) or perplexity (which scores data-fit, not agreement-with-the-original). The A/B below confirms this empirically: training on TVD directly beats KL-distillation on TVD, KL, *and* top-1 at once.
+- **Accept-rate**, when it *proposes for* the original (speculative decoding): `1 − TVD` is exactly the single-token acceptance probability under the maximal coupling that speculative decoding implements (Leviathan et al.) — not the independent-draw same-token rate `Σ p₀ᵢ p_θᵢ`, which is smaller.
+
+The corrector is cheap and **mergeable** → zero inference overhead once tuned to a (workload, target). A per-workload optimizer then picks the operating point (compression rank, draft depth `K`). Both instances are now measured under this one objective; the planned sweep puts them on a single VRAM budget.
+
+**Why the big model can't be its own draft.** A tempting further regime — use the MLA-compressed 4B as the *draft* for the original 4B — does not pay off, and the reason clarifies what MLA does and doesn't buy. Batch-1 decode is weight-bandwidth-bound: the dominant per-token cost is reading the ~8 GB of BF16 weights, and MLA compresses the *KV cache*, not the weight matrices. So an MLA-4B's per-forward cost relative to the 4B target is `c ≈ 1`, and `S(α, c, K)` at `c = 1` is `< 1` for every `α < 1` — actively slower than not drafting. Only a genuinely smaller model (0.6B, ~6× fewer weight bytes → `c ≈ 0.3`) supplies the low `c` a draft needs. MLA's role in the spec-decode setting is therefore as the *target* — cheaper KV frees VRAM for longer context or a fitter draft — never as a fast draft.
 
 ## The interaction question (planned sweep)
 
