@@ -95,6 +95,7 @@ This section states *what* the pipeline minimizes and *why* it is structured as 
 - **Activation-aware SVD:** ASVD (Yuan et al., 2023); SVD-LLM (Wang et al., ICLR 2024) — the truncation-aware `√C·W` whitening used here.
 - **Fisher-weighted compression:** OBD/OBS/OBC → GPTQ; FWSVD (Hsu et al., 2022); **GFWSVD** (Chekalina et al., 2025) — K-FAC Fisher `F ≈ C ⊗ G` (input-covariance ⊗ output-gradient-covariance), the factorization invoked below.
 - **Distillation recovery:** Hinton et al. (2015). **LoRA healing of an attention swap:** LoLCATs (Zhang et al., 2024).
+- **Speculative decoding (draft side):** Leviathan et al. (ICML 2023) and Chen et al. (2023) — the accept rule and the cost coefficient `c`. **DistillSpec** (Zhou et al., ICLR 2024) is the nearest method to the draft-tuning half here: it distills a draft to the target and tailors the *divergence* (including total-variation distance) to the decoding strategy — the same objective this project uses, though on a full-precision draft with full-model distillation rather than a per-workload LoRA. **Training Domain Draft Models** (Hong et al., ICLR 2025 workshop) specializes drafts per domain (finding offline white-box distillation best); *LK Losses* (Samarin et al., 2026) and *Variational Speculative Decoding* (Zou et al., 2026) optimize acceptance directly. Quantized drafts appear in **QSpec** (Zhao et al., EMNLP 2025) and **QuantSpec** (Tiwari et al., 2025), but training-free — neither trains an adapter against acceptance, which is the open corner a quantized-draft TVD-LoRA would fill.
 
 **CARE is the nearest published method** — activation-aware SVD init + water-filling rank allocation + CE+KL healing, evaluated on Qwen3-4B. This pipeline differs in four ways CARE does not combine: (1) a **joint** `[K_nope; V]` latent with a shared down-projection (closer to native MLA) vs CARE's separate per-matrix factoring; (2) an explicit **output-gradient / Fisher** weighting on top of the input-covariance whitening CARE stops at; (3) **distill-to-raw-original** as the primary clean estimand with **LoRA-scoped** healing; (4) a characterization of **why naive rank allocation fails** that explains CARE's own PPL-vs-uniform result.
 
@@ -175,7 +176,12 @@ Deferred, each a natural follow-on: probabilistic speculative verify (rejection 
 - Yuan et al. "ASVD: Activation-aware Singular Value Decomposition" (2023).
 - Wang et al. "SVD-LLM: Truncation-aware SVD for LLM Compression" (ICLR 2024).
 - Hsu et al. "Language Model Compression with Weighted Low-Rank Factorization" (FWSVD, 2022); Chekalina et al. "GFWSVD" (2025).
-- Leviathan, Kalman, Matias. "Fast Inference from Transformers via Speculative Decoding" (ICML 2023).
+- Leviathan, Kalman, Matias. "Fast Inference from Transformers via Speculative Decoding" (ICML 2023, arXiv:2211.17192); Chen et al. "Accelerating Large Language Model Decoding with Speculative Sampling" (2023, arXiv:2302.01318).
+- Zhou et al. "DistillSpec: Improving Speculative Decoding via Knowledge Distillation" (ICLR 2024, arXiv:2310.08461).
+- Hong et al. "Training Domain Draft Models for Speculative Decoding: Best Practices and Insights" (ICLR 2025 SCOPE workshop, arXiv:2503.07807).
+- Samarin et al. "LK Losses: Direct Acceptance Rate Optimization for Speculative Decoding" (2026, arXiv:2602.23881); Zou et al. "Variational Speculative Decoding" (2026, arXiv:2602.05774).
+- Zhao et al. "QSpec: Speculative Decoding with Complementary Quantization Schemes" (EMNLP 2025, arXiv:2410.11305); Tiwari et al. "QuantSpec: Self-Speculative Decoding with Hierarchical Quantized KV Cache" (2025, arXiv:2502.10424).
+- Dettmers et al. "QLoRA: Efficient Finetuning of Quantized LLMs" (NeurIPS 2023, arXiv:2305.14314).
 
 ## License
 

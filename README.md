@@ -105,7 +105,7 @@ uv run python -m mla.heal     --mla-artifact experiments/stage_b/qwen_qwen3_4b_r
 uv run pytest
 ```
 
-See [`DESIGN.md`](./DESIGN.md) for the full technical plan, prior-art lineage, and the objective/initialization/healing derivation.
+See [`DESIGN.md`](./DESIGN.md) for the full technical plan, prior work, and the objective/initialization/healing derivation.
 
 ## License
 
