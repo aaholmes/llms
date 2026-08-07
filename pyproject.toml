@@ -21,7 +21,7 @@ requires = ["hatchling"]
 build-backend = "hatchling.build"
 
 [tool.hatch.build.targets.wheel]
-packages = ["src/engine", "src/kernels", "src/bench", "src/mla"]
+packages = ["src/engine", "src/kernels", "src/bench", "src/mla", "src/quant"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
