@@ -280,11 +280,8 @@ def build_model(spec: ModelSpec, *, device: str, dtype: torch.dtype):
 
 
 def _alloc_cache(model, max_seq_len: int):
-    from engine.mla import MLAttention
-    from mla.swap import alloc_mla_cache
-
-    if any(isinstance(m, MLAttention) for m in model.modules()):
-        return alloc_mla_cache(model, max_seq_len)
+    # alloc_cache is MLA-aware: it returns an MLAKVCache when MLAttention has
+    # been swapped in, so every path (greedy, ppl, spec decode) shares it.
     return model.alloc_cache(max_seq_len)
 
 

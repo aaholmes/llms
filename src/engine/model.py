@@ -170,6 +170,14 @@ class Qwen3Model(nn.Module):
         dtype: torch.dtype | None = None,
         device: torch.device | str | None = None,
     ) -> KVCache:
+        from .mla import MLAttention
+
+        if any(isinstance(b.attn, MLAttention) for b in self.layers):
+            from mla.swap import alloc_mla_cache
+
+            return alloc_mla_cache(
+                self, max_seq_len, max_batch=max_batch, dtype=dtype, device=device
+            )
         if dtype is None:
             dtype = self.embed.weight.dtype
         if device is None:
