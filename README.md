@@ -2,22 +2,22 @@
 
 [![tests](https://github.com/aaholmes/llms/actions/workflows/tests.yml/badge.svg)](https://github.com/aaholmes/llms/actions/workflows/tests.yml)
 
-**Make an already-trained LLM cheaper to run — no pretraining — by swapping in a lossy attention block and training a small adapter to claw back the quality it costs, both measured against a matched control.**
+**Make an already-trained large language model cheaper to run — no pretraining — by swapping in a lossy attention block and training a small adapter to claw back the quality it costs, both measured against a matched control.**
 
 ## The idea
 
-Decoding one token at a time is bottlenecked by attention: the model re-reads a cached key and value for every head and every past position, and it re-runs a big target network for every token it emits. That memory traffic — not compute — sets the ceiling on context length and speed, and the ceiling bites soonest on a fixed VRAM budget (here, 16 GB).
+Decoding one token at a time is bottlenecked by attention: the model re-reads a cached key and value for every head and every past position, and it re-runs a big target network for every token it emits. That memory traffic — not compute — sets the ceiling on context length and speed, and the ceiling bites soonest on a fixed GPU-memory budget (here, 16 GB).
 
 There are several ways to make attention cheaper, and they sit on different axes:
 
-- **Shrink what you store per token** — replace full-size keys/values with a small latent (Multi-head Latent Attention, MLA), cutting the KV cache 4–8×.
+- **Shrink what you store per token** — replace full-size keys/values with a small latent (Multi-head Latent Attention, MLA), cutting the key/value (KV) cache 4–8×.
 - **Shrink the model that proposes tokens** — let a small draft model guess several tokens and have the target verify them in one pass (speculative decoding).
 
 Each is *lossy*: it changes the model's output distribution and costs quality. This project treats them as instances of one pattern and applies the same corrector to both:
 
-> **A cheap lossy attention block, plus a small LoRA adapter trained to minimize total-variation distance to the original — `TVD = ½‖p − q‖₁`, equivalently `1 − Σ min(p, q)` — pulling the degraded model back toward the original's next-token distribution.**
+> **A cheap lossy attention block, plus a small low-rank (LoRA) adapter trained to minimize total-variation distance to the original — `TVD = ½‖p − q‖₁`, equivalently `1 − Σ min(p, q)` — pulling the degraded model back toward the original's next-token distribution.**
 
-The metric is the point. TVD reads two ways depending on how the cheap model is deployed. When it *replaces* the original (standalone MLA), `1 − TVD` is a fidelity distance — the sharpest bound on how often the two models' behavior can diverge on any downstream measure. When it *proposes for* the original (speculative decoding — a small draft against the MLA-compressed model as target), that same `1 − TVD` is literally the token accept-rate. Either way it is the quantity that cashes out — not a smooth surrogate like KL or cross-entropy. The adapter is tiny and **mergeable**, so once tuned for a workload it adds zero inference overhead.
+The metric is the point. TVD reads two ways depending on how the cheap model is deployed. When it *replaces* the original (standalone MLA), `1 − TVD` is a fidelity distance — the sharpest bound on how often the two models' behavior can diverge on any downstream measure. When it *proposes for* the original (speculative decoding — a small draft proposing for the MLA-compressed model as target), that same `1 − TVD` is literally the token accept-rate. Either way it is the quantity that cashes out — not a smooth surrogate like Kullback–Leibler (KL) divergence or cross-entropy. The adapter is tiny and **mergeable**, so once tuned for a workload it adds zero inference overhead.
 
 Everything runs on a **from-scratch Qwen3 inference engine that is bit-exact with HuggingFace** — no `AutoModelForCausalLM` in the hot path, so the attention block can be swapped out and profiled directly.
 
@@ -25,16 +25,16 @@ Everything runs on a **from-scratch Qwen3 inference engine that is bit-exact wit
 
 ## Instance 1 — MLA: shrink what you store, heal what you lose
 
-**Convert Qwen3-4B to MLA after the fact, without retraining**, then quantify the KV-compression cost against a matched control.
+**Convert Qwen3-4B to MLA after the fact, without retraining**, then quantify the KV-compression cost relative to a matched control.
 
 1. **Calibrate.** Stream a corpus through the original model and record each attention layer's activation statistics.
-2. **Compress.** Factor each layer's K/V projections with an SVD *weighted by those statistics*, so the low-rank latent minimizes error on the activations the model actually sees — one shared down-projection over `[K; V]` plus small per-head up-projections.
-3. **Handle RoPE.** Rotary embeddings sit algebraically between the Q and K projections and block MLA's fusion trick. Following DeepSeek-V3, each head splits into a compressed no-rotation subspace and a small full-rank rotated subspace ("partial RoPE").
+2. **Compress.** Factor each layer's key and value (K/V) projections with a singular value decomposition (SVD) *weighted by those statistics*, so the low-rank latent minimizes error on the activations the model actually sees — one shared down-projection over `[K; V]` plus small per-head up-projections.
+3. **Handle rotary embeddings.** Rotary position embeddings (RoPE) sit algebraically between the query and key projections and block MLA's fusion trick. Following DeepSeek-V3, each head splits into a compressed no-rotation subspace and a small full-rank rotated subspace ("partial RoPE").
 4. **Heal.** A short finetune (~3 h on one 16 GB GPU) trains only the new latent projections plus small LoRA adapters and recovers most of the lost quality.
 
 ### The compression–quality frontier
 
-Perplexity on held-out WikiText-103 (Qwen3-4B, BF16; baseline PPL 21.6). Without finetuning, 4× compression is unusable (+826% PPL). After healing — measured against an *uncompressed model finetuned on the same data and the same budget*, so the figure is compression cost, not domain adaptation:
+Perplexity (PPL) on held-out WikiText-103 (Qwen3-4B, bfloat16; baseline PPL 21.6). Without finetuning, 4× compression is unusable (+826% PPL). After healing — measured against an *uncompressed model finetuned on the same data and the same budget*, so the figure is compression cost, not domain adaptation:
 
 | KV compression | PPL cost vs matched control |
 |---|---|
@@ -64,7 +64,7 @@ Allocating the rank budget per layer by each layer's activation spectrum — the
 
 ## Instance 2 — Speculative decoding: shrink what proposes, tune what it says
 
-Same corrector, different lossy block. Here the "lossy" model is a **small draft** (Qwen3-0.6B) proposing tokens for the 4B target. A draft LoRA is TVD-tuned to a workload so the draft's proposals match what the target would say — raising acceptance, and with it end-to-end throughput. The adapter is merged before timing, so base and tuned drafts run at identical speed and only the weights differ.
+The corrector is unchanged; only the lossy block differs. Here the "lossy" model is a **small draft** (Qwen3-0.6B) proposing tokens for the 4B target. A draft LoRA is TVD-tuned to a workload so the draft's proposals match what the target would say — raising acceptance, and with it end-to-end throughput. The adapter is merged before timing, so base and tuned drafts run at identical speed and only the weights differ.
 
 ![Draft-tuning lifts the speedup-vs-K curve on both workloads](experiments/stage_b/draft_speedup_plot.png)
 
@@ -77,16 +77,16 @@ Higher acceptance lifts the whole speedup-vs-depth curve and pushes the optimal 
 
 The gain is **workload-dependent**, as the pattern predicts: a narrow workload starts from higher acceptance, so tuning buys more and the optimal K moves further out. The ceiling is set by draft cost, not acceptance. Profiling puts each draft forward at ~30% of a target forward — fixed per-round overhead inflates it above the 0.15 parameter ratio — which caps the optimal draft depth near 3–4. Past that, the lever is making the draft cheaper *relative to* the target (a smaller or quantized draft, or a larger target), not squeezing out more acceptance.
 
-This is why the two instances belong in one repo: MLA lowers the *storage* cost of an operating point and speculative decoding lowers the *proposal* cost, but both degrade the output distribution, and the **same TVD-trained LoRA** repairs both.
+This is why the two instances belong in one repo: MLA lowers the *storage* cost of an operating point and speculative decoding lowers the *proposal* cost, but both degrade the output distribution, and the same recipe — **a TVD-trained LoRA** — repairs both.
 
 ---
 
 ## What's built, what's next
 
-**Built and tested** (120 tests, CPU subset in CI):
+**Built and tested** (120 tests; a CPU-only subset runs in continuous integration):
 
 - **Inference engine** — manual Qwen3 forward pass, contiguous and compressed KV caches, sequential speculative decoding; bit-exact with HuggingFace. Greedy matches HuggingFace tok/s to one decimal — the manual path pays no correctness-for-speed tax.
-- **Two fused Triton kernels** — they win in isolation but do *not* beat cuBLAS end-to-end at batch=1: the decode path is memory-bandwidth-bound and per-launch overhead erodes the gain. Post-mortem in [`DESIGN.md`](./DESIGN.md).
+- **Two fused Triton kernels** — they win in isolation but do *not* beat NVIDIA's cuBLAS library end-to-end at batch=1: the decode path is memory-bandwidth-bound and per-launch overhead erodes the gain. Post-mortem in [`DESIGN.md`](./DESIGN.md).
 - **MLA conversion** — calibration, activation-aware joint SVD, partial-RoPE swap, perplexity/KL/TVD evaluation, and the healing finetune (`src/mla/`).
 - **Draft-tuning** — TVD-tuning a draft LoRA to a workload and target, with a merge-and-time end-to-end speedup bench.
 
