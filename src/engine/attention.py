@@ -144,16 +144,21 @@ class Attention(nn.Module):
             attn = attn.transpose(1, 2).reshape(B, T, self.num_heads * self.head_dim)
             return self.o(attn)
 
+        # GQA: decode and first-chunk prefill let SDPA share each KV head across its
+        # query heads (enable_gqa) instead of materializing an n_rep-times copy of the
+        # cache, which reads ~9x the necessary bytes at decode. The masked branch keeps
+        # the explicit copy: with enable_gqa + attn_mask, SDPA falls back to a slower path.
         n_rep = self.num_heads // self.num_kv_heads
-        if n_rep > 1:
-            full_k = full_k.repeat_interleave(n_rep, dim=1)
-            full_v = full_v.repeat_interleave(n_rep, dim=1)
+        gqa = n_rep > 1
 
         if T == 1:
-            attn = F.scaled_dot_product_attention(q, full_k, full_v, is_causal=False)
+            attn = F.scaled_dot_product_attention(q, full_k, full_v, is_causal=False, enable_gqa=gqa)
         elif start_pos == 0:
-            attn = F.scaled_dot_product_attention(q, full_k, full_v, is_causal=True)
+            attn = F.scaled_dot_product_attention(q, full_k, full_v, is_causal=True, enable_gqa=gqa)
         else:
+            if gqa:
+                full_k = full_k.repeat_interleave(n_rep, dim=1)
+                full_v = full_v.repeat_interleave(n_rep, dim=1)
             q_pos = torch.arange(start_pos, end_pos, device=q.device).unsqueeze(1)
             k_pos = torch.arange(0, end_pos, device=q.device).unsqueeze(0)
             mask = q_pos >= k_pos
