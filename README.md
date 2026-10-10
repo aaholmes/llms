@@ -38,7 +38,7 @@ Perplexity (PPL) on held-out WikiText-103 (Qwen3-4B, bfloat16; baseline PPL 21.6
 
 | KV compression | PPL cost vs matched control |
 |---|---|
-| 1.33× | **+0.5%** (deployment-safe) |
+| 1.33× | **+0.5%** |
 | 4.0× | **+16%** |
 | 5.33× | +41% |
 
@@ -59,6 +59,28 @@ A **two-sided Fisher-weighted SVD initialization** — adding the output-gradien
 ### A negative result worth keeping
 
 Allocating the rank budget per layer by each layer's activation spectrum — the "obvious" optimization — is *worse* than uniform allocation at every setting tried, because per-layer reconstruction error can't see that an early layer's error propagates and amplifies through every later layer. This corroborates the closest published method (CARE), whose adaptive allocation also underperforms uniform on perplexity.
+
+### Perplexity does not predict retrieval
+
+A second test asks the model to do something, not just to score text: a 7-digit number is hidden in 1K–32K tokens of filler, and a chat-formatted question asks for it back (a needle-in-a-haystack test; prompt wording from *On-Policy Attention Linearization*, [arXiv:2609.31947](https://arxiv.org/abs/2609.31947)). Accuracy in %, 100 prompts per cell, greedy decoding, Qwen3's thinking mode off:
+
+| Model | 1K | 4K | 8K | 16K | 32K |
+|---|---:|---:|---:|---:|---:|
+| Uncompressed | 100 | 100 | 100 | 100 | 100 |
+| Uncompressed, finetuned on WikiText (the matched control) | 100 | 100 | 100 | 100 | 100 |
+| 1.33×, healed | 100 | 89 | 8 | 7 | 81 |
+| 1.33×, not healed | 58 | 94 | — | — | — |
+| 1.33×, not healed, calibrated on chat prompts | 91 | 100 | — | — | — |
+| 4×, healed on WikiText text | 0 | 0 | — | — | — |
+| 4×, healed to match the original's predictions on WikiText | 30 | 0 | — | — | — |
+
+A cell at 100 has a 95% interval of [96.3, 100] and a cell at 0 has [0, 3.7]; "—" was not run.
+
+- **The 4× model no longer follows instructions.** It answers the question with encyclopedia prose, even though its WikiText perplexity after healing is below the original's. The 4× conversion alone also scores 0, while the matched control keeps 100: a model this damaged gets rebuilt from whatever the healing text covers, and WikiText covers no conversations.
+- **The 1.33× model retrieves at short range and breaks at 8K–16K.** Its misses are not wrong numbers; it repeats an end-of-thinking tag until the token limit. Healing used 1,024-token chunks.
+- **The calibration text matters.** Collecting the SVD's activation statistics on chat-formatted prompts (Dolly-15K, an equal 256,000-token budget) lifts the un-healed 1.33× model by 33 points [22, 44] at 1K, with no training.
+
+The other two tasks in that paper (four needles with one or all four queried) rank the models in that order too. This is one family of synthetic tasks under one decoding setting, so it shows what the perplexity frontier above misses, not how the models behave in general.
 
 ---
 
@@ -89,9 +111,11 @@ This is why the two instances belong in one repo: MLA lowers the *storage* cost 
 - **Two fused Triton kernels** — they win in isolation but do *not* beat NVIDIA's cuBLAS library end-to-end at batch=1: the decode path is memory-bandwidth-bound and per-launch overhead erodes the gain. Post-mortem in [`DESIGN.md`](./DESIGN.md).
 - **MLA conversion** — calibration, activation-aware joint SVD, partial-RoPE swap, perplexity/KL/TVD evaluation, and the healing finetune (`src/mla/`).
 - **Draft-tuning** — TVD-tuning a draft LoRA to a workload and target, with a merge-and-time end-to-end speedup bench.
+- **Long-context retrieval eval** — needle-in-a-haystack prompts up to 32K tokens, with chunked prefill so the uncompressed model fits in 16 GB (`src/bench/niah.py`).
 
 **Planned:**
 
+- **Healing on chat-formatted data** — train the compressed model to match the original on conversations, not WikiText, and re-run the retrieval test at 4×.
 - **Joint sweep at fixed 16 GB** — how KV compression, draft choice, and draft depth trade off together, using the MLA-compressed model as the draft (freed KV budget cashes out as a fitter draft or longer context). The headline study the whole pipeline was built to run.
 
 ## Run it
@@ -102,6 +126,9 @@ uv sync --extra gpu
 uv run python -m mla.calibrate Qwen/Qwen3-4B --samples 1000 --chunk-tokens 256 --out experiments/stage_b/calib/wt103_1k.pt
 uv run python -m mla.convert  Qwen/Qwen3-4B --rank 256 --d-rope 32 --calib wt103-1k
 uv run python -m mla.heal     --mla-artifact experiments/stage_b/qwen_qwen3_4b_r256_drope32.pt --out experiments/stage_b/heal_r256_drope32
+# Retrieval eval: collect rows per model, then summarize
+uv run python -m experiments.stage_b.niah_eval --arms uncompressed mla-1.33x --lengths 1024 4096
+uv run python -m experiments.stage_b.niah_analyze
 uv run pytest
 ```
 

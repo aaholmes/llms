@@ -339,3 +339,63 @@ def load_code_chunks(
             if len(chunks) >= n_samples:
                 return chunks
     return chunks
+
+
+def pack_prompts(
+    id_lists, *, total_tokens: int, max_tokens: int
+) -> list[torch.Tensor]:
+    """Turn token-id lists into (1, T) prompts totalling exactly ``total_tokens``.
+
+    Each list is one whole prompt (it is not concatenated with its neighbours),
+    truncated to ``max_tokens``; the last prompt is cut so the total is exact.
+    Returns fewer tokens only if ``id_lists`` runs out first.
+    """
+    prompts: list[torch.Tensor] = []
+    remaining = total_tokens
+    for ids in id_lists:
+        if remaining <= 0:
+            break
+        ids = list(ids)[: min(max_tokens, remaining)]
+        if not ids:
+            continue
+        prompts.append(torch.tensor(ids, dtype=torch.long).unsqueeze(0))
+        remaining -= len(ids)
+    return prompts
+
+
+def load_chat_prompts(
+    total_tokens: int,
+    *,
+    max_tokens: int = 1024,
+    tokenizer_id: str = "Qwen/Qwen3-4B",
+    seed: int = 42,
+) -> list[torch.Tensor]:
+    """Chat-formatted calibration prompts from Dolly-15K (instruction, context, response).
+
+    Each example is rendered the way the model sees a conversation at inference:
+    the tokenizer's chat template with thinking off, followed by the reference
+    response and the end-of-turn token. Examples are taken in a seeded shuffled
+    order until ``total_tokens`` is reached. Contrast to
+    ``load_wikitext103_chunks``, which yields raw prose with no template.
+    """
+    from datasets import load_dataset
+    from transformers import AutoTokenizer
+
+    ds = load_dataset("databricks/databricks-dolly-15k", split="train")
+    tok = AutoTokenizer.from_pretrained(tokenizer_id)
+    rng = torch.Generator().manual_seed(seed)
+
+    def rendered():
+        for idx in torch.randperm(len(ds), generator=rng).tolist():
+            ex = ds[idx]
+            user = ex["instruction"]
+            if ex["context"].strip():
+                user = f"{user}\n\n{ex['context']}"
+            text = tok.apply_chat_template(
+                [{"role": "user", "content": user}],
+                add_generation_prompt=True, enable_thinking=False, tokenize=False,
+            )
+            text += ex["response"] + "<|im_end|>\n"
+            yield tok(text, add_special_tokens=False)["input_ids"]
+
+    return pack_prompts(rendered(), total_tokens=total_tokens, max_tokens=max_tokens)

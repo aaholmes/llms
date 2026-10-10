@@ -142,3 +142,24 @@ def test_explicit_cpu_override_still_works(small_model, small_prompts):
         covs = col.covariances()
     for c in covs:
         assert c.device == torch.device("cpu")
+
+
+# --- chat-formatted calibration prompts ---------------------------------------
+
+def test_pack_prompts_truncates_and_stops_at_the_token_budget() -> None:
+    from mla.calibrate import pack_prompts
+
+    prompts = pack_prompts(
+        [[1] * 3, [2] * 10, [3] * 4, [4] * 4], total_tokens=12, max_tokens=6
+    )
+
+    assert [p.shape for p in prompts] == [(1, 3), (1, 6), (1, 3)]
+    assert sum(p.shape[1] for p in prompts) == 12
+    assert prompts[1].dtype == torch.long and prompts[1][0, 0] == 2
+
+
+def test_pack_prompts_returns_everything_when_the_budget_is_not_reached() -> None:
+    from mla.calibrate import pack_prompts
+
+    prompts = pack_prompts([[1, 2], [3]], total_tokens=100, max_tokens=8)
+    assert [p.tolist() for p in prompts] == [[[1, 2]], [[3]]]
