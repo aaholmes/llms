@@ -2,7 +2,7 @@
 
 [![tests](https://github.com/aaholmes/llms/actions/workflows/tests.yml/badge.svg)](https://github.com/aaholmes/llms/actions/workflows/tests.yml)
 
-**Make an already-trained large language model cheaper to run — no pretraining — by swapping in a lossy attention block and training a small adapter to claw back the quality it costs, both measured against a matched control.**
+**Make an already-trained large language model cheaper to run — no pretraining — by swapping in a lossy attention block and training a small adapter to recover the quality it costs, both measured against a matched control.**
 
 ## The idea
 
@@ -17,7 +17,7 @@ Each is *lossy*: it changes the model's output distribution and costs quality. T
 
 > **A cheap lossy attention block, plus a small low-rank (LoRA) adapter trained to minimize total-variation distance to the original — `TVD = ½‖p − q‖₁`, equivalently `1 − Σ min(p, q)` — pulling the degraded model back toward the original's next-token distribution.**
 
-The metric is the point. TVD reads two ways depending on how the cheap model is deployed. When it *replaces* the original (standalone MLA), `1 − TVD` is a fidelity distance — the sharpest bound on how often the two models' behavior can diverge on any downstream measure. When it *proposes for* the original (speculative decoding — a small draft proposing for the MLA-compressed model as target), that same `1 − TVD` is literally the token accept-rate. Either way it is the quantity that cashes out — not a smooth surrogate like Kullback–Leibler (KL) divergence or cross-entropy. The adapter is tiny and **mergeable**, so once tuned for a workload it adds zero inference overhead.
+The metric is the point. TVD reads two ways depending on how the cheap model is deployed. When it *replaces* the original (standalone MLA), `1 − TVD` is a fidelity distance — the sharpest bound on how often the two models' behavior can diverge on any downstream measure. When it *proposes for* the original (speculative decoding — a small draft proposing for the MLA-compressed model as target), that same `1 − TVD` is literally the token accept-rate. Either way it is the quantity the deployment depends on, not a smooth surrogate like Kullback–Leibler (KL) divergence or cross-entropy. The adapter is tiny and **mergeable**, so once tuned for a workload it adds zero inference overhead.
 
 Everything runs on a **from-scratch Qwen3 inference engine that is bit-exact with HuggingFace** — no `AutoModelForCausalLM` in the hot path, so the attention block can be swapped out and profiled directly.
 
@@ -26,6 +26,8 @@ Everything runs on a **from-scratch Qwen3 inference engine that is bit-exact wit
 ## Instance 1 — MLA: shrink what you store, heal what you lose
 
 **Convert Qwen3-4B to MLA after the fact, without retraining**, then quantify the KV-compression cost relative to a matched control.
+
+Earlier work on converting a trained model to MLA includes TransMLA ([arXiv:2502.07864](https://arxiv.org/abs/2502.07864)) and CARE ([arXiv:2603.17946](https://arxiv.org/abs/2603.17946)). CARE is the nearest method and also evaluates on Qwen3-4B; [`DESIGN.md`](./DESIGN.md) lists how this pipeline differs from it.
 
 1. **Calibrate.** Stream a corpus through the original model and record each attention layer's activation statistics.
 2. **Compress.** Factor each layer's key and value (K/V) projections with a singular value decomposition (SVD) *weighted by those statistics*, so the low-rank latent minimizes error on the activations the model actually sees — one shared down-projection over `[K; V]` plus small per-head up-projections.
@@ -50,9 +52,9 @@ The matched control is the crux. A same-budget finetune of the *uncompressed* mo
 
 The real objective isn't "predict WikiText" — it's "behave like the original model." Fidelity here is `1 − TVD` to the frozen original: the fraction of probability mass the two models agree on, token by token. Healing on **KL-divergence** to the original drives the 4× model to KL 0.40 / 76% top-1 agreement — closer to the original than even a finetuned *uncompressed* model gets.
 
-But KL is a surrogate for that fidelity, not the thing itself. Healing to minimize **TVD directly** beats the KL-trained model on every fidelity measure at once: **80% agreement (`1 − TVD`) at 4× vs 74%**, and lower KL and higher top-1 too. Optimizing the distance you care about wins over the smooth surrogate. (In a speculative-decode deployment this same 80% is the token accept-rate — see Instance 2.)
+But KL is a surrogate for that fidelity, not the thing itself. Healing to minimize **TVD directly** beats the KL-trained model on every fidelity measure: **80% agreement (`1 − TVD`) at 4× vs 74%**, and lower KL and higher top-1 too. Optimizing the distance you care about wins over the smooth surrogate. (In a speculative-decode deployment this same 80% is the token accept-rate — see Instance 2.)
 
-A **two-sided Fisher-weighted SVD initialization** — adding the output-gradient term the nearest published method omits — improves the starting point before any healing and holds a small consistent edge after.
+A **two-sided Fisher-weighted SVD initialization** — adding the output-gradient term that CARE omits — improves the starting point before any healing and holds a small consistent edge after.
 
 ![Fidelity to the original by training objective at 4× compression](experiments/stage_b/kl_plot.png)
 
@@ -77,7 +79,7 @@ A second test asks the model to do something, not just to score text: a 7-digit 
 A cell at 100 has a 95% interval of [96.3, 100] and a cell at 0 has [0, 3.7]; "—" was not run.
 
 - **The 4× model no longer follows instructions.** It answers the question with encyclopedia prose, even though its WikiText perplexity after healing is below the original's. The 4× conversion alone also scores 0, while the matched control keeps 100: a model this damaged gets rebuilt from whatever the healing text covers, and WikiText covers no conversations.
-- **The 1.33× model retrieves at short range and breaks at 8K–16K.** Its misses are not wrong numbers; it repeats an end-of-thinking tag until the token limit. Healing used 1,024-token chunks.
+- **The 1.33× model retrieves at short range and breaks at 8K–16K.** Its misses are not wrong numbers; it repeats an end-of-thinking tag until the token limit. Healing used 1,024-token chunks. The partial recovery to 81% at 32K is not yet explained.
 - **The calibration text matters.** Collecting the SVD's activation statistics on chat-formatted prompts (Dolly-15K, an equal 256,000-token budget) lifts the un-healed 1.33× model by 33 points [22, 44] at 1K, with no training.
 
 The other two tasks in that paper (four needles with one or all four queried) rank the models in that order too. This is one family of synthetic tasks under one decoding setting, so it shows what the perplexity frontier above misses, not how the models behave in general.
@@ -105,7 +107,7 @@ This is why the two instances belong in one repo: MLA lowers the *storage* cost 
 
 ## What's built, what's next
 
-**Built and tested** (120 tests; a CPU-only subset runs in continuous integration):
+**Built and tested** (245 tests; a CPU-only subset runs in continuous integration):
 
 - **Inference engine** — manual Qwen3 forward pass, contiguous and compressed KV caches, sequential speculative decoding; bit-exact with HuggingFace. Greedy matches HuggingFace tok/s to one decimal — the manual path pays no correctness-for-speed tax.
 - **Two fused Triton kernels** — they win in isolation but do *not* beat NVIDIA's cuBLAS library end-to-end at batch=1: the decode path is memory-bandwidth-bound and per-launch overhead erodes the gain. Post-mortem in [`DESIGN.md`](./DESIGN.md).
@@ -116,7 +118,8 @@ This is why the two instances belong in one repo: MLA lowers the *storage* cost 
 **Planned:**
 
 - **Healing on chat-formatted data** — train the compressed model to match the original on conversations, not WikiText, and re-run the retrieval test at 4×.
-- **Joint sweep at fixed 16 GB** — how KV compression, draft choice, and draft depth trade off together, using the MLA-compressed model as the draft (freed KV budget cashes out as a fitter draft or longer context). The headline study the whole pipeline was built to run.
+- **On-policy distillation** — train the compressed model on its own generated continuations, scored by the original, following *On-Policy Attention Linearization*; test whether it repairs the 8K–16K retrieval failures at 1.33×.
+- **Joint sweep at fixed 16 GB** — how KV compression, draft choice, and draft depth trade off together, using the MLA-compressed model as the draft (the freed KV budget can be spent on a fitter draft or a longer context). The headline study the whole pipeline was built to run.
 
 ## Run it
 
